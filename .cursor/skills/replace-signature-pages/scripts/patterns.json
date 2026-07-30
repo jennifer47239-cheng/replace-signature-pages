@@ -1,0 +1,80 @@
+{
+  "strong": {
+    "zh": [
+      "签字页",
+      "签署页",
+      "签章页",
+      "签字盖章页",
+      "本页无正文",
+      "以下无正文",
+      "为签字盖章页",
+      "为签署页",
+      "之签字页",
+      "之签署页"
+    ],
+    "en": [
+      "SIGNATURE PAGE",
+      "SIGNATURE PAGES",
+      "EXECUTION PAGE",
+      "EXECUTION PAGES",
+      "Signature Page to",
+      "IN WITNESS WHEREOF"
+    ]
+  },
+  "medium": {
+    "zh": [
+      "法定代表人",
+      "授权代表",
+      "授权代表人",
+      "签字",
+      "盖章",
+      "公章",
+      "合同专用章",
+      "签署日期",
+      "特此为证",
+      "甲方",
+      "乙方",
+      "丙方"
+    ],
+    "en": [
+      "FOR AND ON BEHALF OF",
+      "Authorized Signatory",
+      "Authorised Signatory",
+      "duly authorized",
+      "Affix Corporate Seal",
+      "Company Chop",
+      "Company Seal",
+      "signed by",
+      "executed as a deed",
+      "By:",
+      "Name:",
+      "Title:",
+      "Witness:",
+      "Witness Name",
+      "in the presence of"
+    ]
+  },
+  "exclude_if_alone": {
+    "zh": [
+      "自双方盖章之日起生效",
+      "本协议自签署之日起生效",
+      "附件清单",
+      "目录"
+    ],
+    "en": [
+      "Table of Contents",
+      "shall become effective upon signing"
+    ]
+  },
+  "weights": {
+    "strong": 3.0,
+    "medium": 1.0,
+    "footer_bonus": 1.5,
+    "title_bonus": 1.0,
+    "blank_ratio_bonus_max": 1.5,
+    "late_page_bonus_max": 0.8,
+    "exclude_penalty": -4.0,
+    "merge_min_score": 2.5,
+    "candidate_min_score": 3.0
+  }
+}

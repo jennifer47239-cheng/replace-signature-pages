@@ -82,7 +82,8 @@ From repo root:
   --contract "/path/to/contract.pdf" \
   --signed "/path/to/signed_a.pdf" \
   --signed "/path/to/signed_b.pdf" \
-  --json --redact-preview
+  --json --redact-preview \
+  --clean-signed-blank-pages
 ```
 
 Read JSON: `candidates`, `signed_page_count`, `comparison`.
@@ -119,7 +120,8 @@ Do not run splice until the user confirms.
 .venv/bin/python tools/replace-signature-pages/splice_signature_pages.py \
   --contract "/path/to/contract.pdf" \
   --replace 12-13:/path/to/signed.pdf \
-  --output "/path/to/contract_已嵌签字页.pdf"
+  --output "/path/to/contract_已嵌签字页.pdf" \
+  --clean-signed-blank-pages
 ```
 
 Pages are **1-based inclusive**.
@@ -135,10 +137,11 @@ Pages are **1-based inclusive**.
 | Path | Role |
 |------|------|
 | `tools/replace-signature-pages/cli.py` | Interactive local CLI |
-| `tools/replace-signature-pages/gui.py` | Simple local GUI |
+| `tools/replace-signature-pages/gui.py` | 本地图形向导（macOS 原生对话框 + 浏览器核对页） |
 | `tools/replace-signature-pages/locate_signature_pages.py` | Read-only locate + L/S JSON |
 | `tools/replace-signature-pages/splice_signature_pages.py` | Confirmed page splice |
 | `tools/replace-signature-pages/patterns.json` | CN/EN keyword weights |
+| `tools/replace-signature-pages/blank_page_detector.py` | 空白页判定（扫描件按墨迹比例）+ 逐页报告 CLI + 人工覆盖 |
 
 `.cursor/skills/.../scripts/*.py` are forwarders only.
 

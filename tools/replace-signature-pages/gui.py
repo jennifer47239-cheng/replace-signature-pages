@@ -1,432 +1,645 @@
 #!/usr/bin/env python3
-"""Simple local GUI: pick PDFs → review candidates → confirm splice (no AI)."""
+"""Local wizard: pick PDFs → locate → visually review → confirm splice (no AI).
+
+Apple's system Tk (8.5.9) does not paint Tk-owned widgets on current macOS, so
+the UI is built from AppleScript dialogs plus an HTML review page opened in the
+browser. Page thumbnails stay in a temp dir that is deleted when the tool exits.
+"""
 
 from __future__ import annotations
 
+import html
+import shutil
+import subprocess
 import sys
-import tkinter as tk
+import tempfile
 from pathlib import Path
-from tkinter import filedialog, messagebox
 
 TOOL_DIR = Path(__file__).resolve().parent
 if str(TOOL_DIR) not in sys.path:
     sys.path.insert(0, str(TOOL_DIR))
 
-BG = "#EEEEEE"
-FG = "#111111"
-BTN_BG = "#DDDDDD"
-ACCENT_BG = "#1F4B7A"
-ACCENT_FG = "#FFFFFF"
-LIST_BG = "#FFFFFF"
-OK_BG = "#E6F4EA"
-WARN_BG = "#FFF3CD"
-ERR_BG = "#F8D7DA"
+# If dialogs lack this stamp in their title, you are not running this file.
+UI_BUILD = "ui-20260730-native"
 
 
-class App(tk.Tk):
-    def __init__(self) -> None:
-        super().__init__()
-        self.title("嵌回签字页 · 本机工具")
-        self.minsize(720, 640)
-        self.geometry("780x680")
-        self.configure(bg=BG)
+class UserCancelled(Exception):
+    """Raised when a dialog is dismissed with Cancel or Esc."""
 
-        self.contract_path: Path | None = None
-        self.signed_paths: list[Path] = []
-        self.candidates: list[dict] = []
 
-        self._build()
-        self.lift()
-        self.focus_force()
+def _log(text: str, kind: str = "info") -> None:
+    print(f"[{kind}] {text}", flush=True)
 
-    def _button(self, parent, text, command, *, accent=False) -> tk.Button:
-        if accent:
-            return tk.Button(
-                parent,
-                text=text,
-                command=command,
-                bg=ACCENT_BG,
-                fg=ACCENT_FG,
-                activebackground="#163A5F",
-                activeforeground=ACCENT_FG,
-                relief="raised",
-                padx=12,
-                pady=6,
-                font=("", 12, "bold"),
+
+# --- AppleScript plumbing ---------------------------------------------------
+
+
+def _as_literal(text: str) -> str:
+    escaped = text.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _osascript(*lines: str) -> str:
+    args: list[str] = ["osascript"]
+    for line in lines:
+        args += ["-e", line]
+    proc = subprocess.run(args, capture_output=True, text=True)
+    if proc.returncode != 0:
+        err = (proc.stderr or "").strip()
+        if "-128" in err or "User canceled" in err or "用户取消" in err:
+            raise UserCancelled()
+        raise RuntimeError(err or f"osascript exited {proc.returncode}")
+    return proc.stdout.strip()
+
+
+def choose_pdf(prompt: str) -> Path:
+    out = _osascript(
+        f"POSIX path of (choose file with prompt {_as_literal(prompt)} "
+        'of type {"com.adobe.pdf"})',
+    )
+    return Path(out)
+
+
+def choose_pdfs(prompt: str) -> list[Path]:
+    out = _osascript(
+        f"set picked to choose file with prompt {_as_literal(prompt)} "
+        'of type {"com.adobe.pdf"} with multiple selections allowed',
+        'set acc to ""',
+        "repeat with f in picked",
+        "set acc to acc & POSIX path of f & linefeed",
+        "end repeat",
+        "return acc",
+    )
+    return [Path(line) for line in out.splitlines() if line.strip()]
+
+
+def ask_buttons(text: str, buttons: list[str], default: str, title: str) -> str:
+    button_list = ", ".join(_as_literal(b) for b in buttons)
+    return _osascript(
+        f"button returned of (display dialog {_as_literal(text)} "
+        f"with title {_as_literal(title)} buttons {{{button_list}}} "
+        f"default button {_as_literal(default)})",
+    )
+
+
+def ask_text(text: str, default_answer: str, title: str) -> str:
+    return _osascript(
+        f"text returned of (display dialog {_as_literal(text)} "
+        f"with title {_as_literal(title)} default answer {_as_literal(default_answer)})",
+    )
+
+
+def choose_from_list(items: list[str], prompt: str, title: str) -> str:
+    item_list = ", ".join(_as_literal(i) for i in items)
+    out = _osascript(
+        f"set chosen to choose from list {{{item_list}}} "
+        f"with prompt {_as_literal(prompt)} with title {_as_literal(title)} "
+        f"default items {{{_as_literal(items[0])}}}",
+        "if chosen is false then error number -128",
+        "return item 1 of chosen",
+    )
+    return out
+
+
+def ask_save_path(default_name: str, default_dir: Path, prompt: str) -> Path:
+    out = _osascript(
+        f"POSIX path of (choose file name with prompt {_as_literal(prompt)} "
+        f"default name {_as_literal(default_name)} "
+        f"default location (POSIX file {_as_literal(str(default_dir))}))",
+    )
+    path = Path(out)
+    return path if path.suffix.lower() == ".pdf" else path.with_suffix(".pdf")
+
+
+def alert(text: str, title: str = "嵌回签字页") -> None:
+    try:
+        ask_buttons(text, ["好"], "好", title)
+    except Exception:
+        _log(text, "err")
+
+
+# --- Browser review pages ---------------------------------------------------
+
+_PAGE_CSS = """
+:root { color-scheme: light; }
+* { box-sizing: border-box; }
+body { margin: 0; padding: 32px 40px 64px; background: #F5F5F7; color: #1D1D1F;
+  font: 15px/1.6 -apple-system, "PingFang SC", "Helvetica Neue", sans-serif; }
+h1 { font-size: 24px; margin: 0 0 4px; }
+.build { color: #86868B; font-size: 12px; margin-bottom: 24px; }
+.panel { background: #FFF; border-radius: 14px; padding: 20px 24px; margin-bottom: 24px;
+  box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+table { border-collapse: collapse; width: 100%; }
+th, td { text-align: left; padding: 7px 0; border-bottom: 1px solid #F0F0F2;
+  vertical-align: top; font-weight: 400; }
+th { width: 140px; color: #6E6E73; }
+tr:last-child th, tr:last-child td { border-bottom: 0; }
+.verdict { border-radius: 10px; padding: 14px 18px; font-weight: 600; margin-bottom: 24px; }
+.verdict.ok { background: #E3F6E8; color: #1B5E20; }
+.verdict.warn { background: #FFF4E0; color: #8A5200; }
+h2 { font-size: 17px; margin: 0 0 14px; }
+.hint { color: #6E6E73; font-size: 13px; margin: -8px 0 16px; }
+.grid { display: grid; gap: 18px; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); }
+.card { margin: 0; background: #FFF; border: 2px solid #E5E5EA; border-radius: 12px;
+  overflow: hidden; }
+.card img { display: block; width: 100%; background: #FFF; }
+.card .missing { padding: 48px 12px; text-align: center; color: #86868B; }
+figcaption { padding: 10px 12px; font-size: 13px; display: flex; flex-direction: column; gap: 2px; }
+figcaption span { color: #6E6E73; font-size: 12px; }
+.card.replace { border-color: #FF3B30; }
+.card.replace figcaption { background: #FFF0EF; }
+.card.context { border-color: #E5E5EA; opacity: .72; }
+.card.insert { border-color: #0071E3; }
+.card.insert figcaption { background: #EDF5FF; }
+.card.blank { border-style: dashed; border-color: #AEAEB2; opacity: .62; }
+.card.blank figcaption { background: #F5F5F7; }
+footer { color: #86868B; font-size: 12px; margin-top: 32px; }
+"""
+
+
+def _html_document(title: str, verdict_class: str, verdict: str, body: str, footer: str) -> str:
+    return f"""<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<title>{html.escape(title)}</title>
+<style>{_PAGE_CSS}</style></head><body>
+<h1>{html.escape(title)}</h1>
+<div class="build">{html.escape(UI_BUILD)} · 本页仅在本机生成，关闭工具后自动删除</div>
+<div class="verdict {verdict_class}">{html.escape(verdict)}</div>
+{body}
+<footer>{html.escape(footer)}</footer>
+</body></html>
+"""
+
+
+def _render_page_pngs(pdf: Path, pages: list[int], out_dir: Path, tag: str) -> dict[int, Path]:
+    """Rasterise 1-based `pages` of `pdf` into out_dir. Returns page → png path."""
+    import fitz
+
+    rendered: dict[int, Path] = {}
+    with fitz.open(str(pdf)) as doc:
+        for page_no in pages:
+            if page_no < 1 or page_no > doc.page_count:
+                continue
+            png = out_dir / f"{tag}_{page_no:04d}.png"
+            doc[page_no - 1].get_pixmap(dpi=72).save(str(png))
+            rendered[page_no] = png
+    return rendered
+
+
+def _card(png: Path | None, caption: str, note: str, css_class: str) -> str:
+    img = (
+        f'<img src="{html.escape(png.name)}" alt="">'
+        if png is not None
+        else '<div class="missing">无法渲染此页</div>'
+    )
+    return (
+        f'<figure class="card {css_class}">{img}'
+        f'<figcaption><strong>{html.escape(caption)}</strong>'
+        f'<span>{html.escape(note)}</span></figcaption></figure>'
+    )
+
+
+def build_review_page(
+    *,
+    review_dir: Path,
+    contract: Path,
+    contract_pages: int,
+    start: int,
+    end: int,
+    signed_paths: list[Path],
+    signed_blank_map: dict[Path, list[int]],
+    signed_total: int,
+    output: Path | None,
+    locate_note: str,
+) -> Path:
+    """Write review.html (with thumbnails) and return its path."""
+    for stale in review_dir.glob("*.png"):
+        stale.unlink(missing_ok=True)
+
+    target_pages = list(range(start, end + 1))
+    context_pages = [p for p in (start - 1, end + 1) if 1 <= p <= contract_pages]
+    contract_pngs = _render_page_pngs(
+        contract, sorted(set(target_pages + context_pages)), review_dir, "c",
+    )
+
+    contract_cards: list[str] = []
+    for page_no in sorted(set(target_pages + context_pages)):
+        if page_no in target_pages:
+            contract_cards.append(
+                _card(contract_pngs.get(page_no), f"第 {page_no} 页", "将被替换", "replace"),
             )
-        return tk.Button(
-            parent,
-            text=text,
-            command=command,
-            bg=BTN_BG,
-            fg=FG,
-            activebackground="#CCCCCC",
-            relief="raised",
-            padx=10,
-            pady=4,
-            font=("", 12),
-        )
-
-    def _set_banner(self, text: str, kind: str = "info") -> None:
-        colors = {
-            "info": (WARN_BG, FG),
-            "ok": (OK_BG, "#0B6B2F"),
-            "err": (ERR_BG, "#8B1E1E"),
-        }
-        bg, fg = colors.get(kind, colors["info"])
-        self.banner.configure(text=text, bg=bg, fg=fg)
-        self.configure(bg=BG)
-        print(f"[{kind}] {text}", flush=True)
-
-    def _alert(self, title: str, text: str) -> None:
-        self._set_banner(f"❌ {title}：{text}", "err")
-        try:
-            messagebox.showerror(title, text, parent=self)
-        except Exception:
-            pass
-
-    def _build(self) -> None:
-        pad = 12
-
-        self.banner = tk.Label(
-            self,
-            text="请先点 ① 选合同，再点 ② 添加已签页，最后才点 ③ 定位",
-            bg=WARN_BG,
-            fg=FG,
-            font=("", 13, "bold"),
-            wraplength=740,
-            justify="left",
-            anchor="w",
-            padx=10,
-            pady=10,
-        )
-        self.banner.pack(fill="x", padx=pad, pady=(12, 8))
-
-        # --- ① contract ---
-        f1 = tk.LabelFrame(self, text="① 合同 PDF", bg=BG, fg=FG, padx=8, pady=6)
-        f1.pack(fill="x", padx=pad, pady=4)
-        self._button(f1, "选择合同 PDF…", self._pick_contract).pack(anchor="w")
-        self.contract_var = tk.StringVar(value="尚未选择")
-        tk.Label(
-            f1, textvariable=self.contract_var, bg=BG, fg=FG, wraplength=700, anchor="w"
-        ).pack(fill="x", pady=(4, 0))
-
-        # --- ② signed ---
-        f2 = tk.LabelFrame(self, text="② 已签签字页", bg=BG, fg=FG, padx=8, pady=6)
-        f2.pack(fill="x", padx=pad, pady=4)
-        row = tk.Frame(f2, bg=BG)
-        row.pack(fill="x")
-        self._button(row, "添加已签签字页…", self._add_signed).pack(side="left")
-        self._button(row, "清空", self._clear_signed).pack(side="left", padx=8)
-        self.signed_list = tk.Listbox(
-            f2,
-            height=3,
-            bg=LIST_BG,
-            fg=FG,
-            relief="solid",
-            borderwidth=1,
-            exportselection=False,
-            font=("", 12),
-        )
-        self.signed_list.pack(fill="x", pady=(6, 0))
-        self.signed_list.insert(tk.END, "（这里会出现已选文件名）")
-
-        # --- ③ locate ---
-        f3 = tk.LabelFrame(self, text="③ 定位候选页", bg=BG, fg=FG, padx=8, pady=6)
-        f3.pack(fill="both", expand=True, padx=pad, pady=4)
-        self._button(f3, "定位候选页", self._run_locate).pack(anchor="w")
-        self.cmp_var = tk.StringVar(value="")
-        tk.Label(
-            f3, textvariable=self.cmp_var, bg=BG, fg=FG, wraplength=700, anchor="w"
-        ).pack(fill="x", pady=(4, 0))
-        self.cand_list = tk.Listbox(
-            f3,
-            height=6,
-            bg=LIST_BG,
-            fg=FG,
-            relief="solid",
-            borderwidth=1,
-            exportselection=False,
-            font=("", 12),
-        )
-        self.cand_list.pack(fill="both", expand=True, pady=(6, 0))
-        self.cand_list.insert(tk.END, "（定位成功后，候选页码会出现在这里）")
-        self.cand_list.bind("<<ListboxSelect>>", self._on_cand_select)
-
-        # --- ④ range + output ---
-        f4 = tk.LabelFrame(self, text="④ 页码与输出", bg=BG, fg=FG, padx=8, pady=6)
-        f4.pack(fill="x", padx=pad, pady=4)
-        r = tk.Frame(f4, bg=BG)
-        r.pack(fill="x")
-        tk.Label(r, text="替换页码:", bg=BG, fg=FG).pack(side="left")
-        self.range_var = tk.StringVar()
-        tk.Entry(
-            r, textvariable=self.range_var, width=16, bg=LIST_BG, fg=FG, font=("", 12)
-        ).pack(side="left", padx=8)
-        tk.Label(r, text="例如 12 或 12-13", bg=BG, fg="#555555").pack(side="left")
-
-        r2 = tk.Frame(f4, bg=BG)
-        r2.pack(fill="x", pady=(6, 0))
-        tk.Label(r2, text="输出:", bg=BG, fg=FG).pack(side="left")
-        self.output_var = tk.StringVar()
-        tk.Entry(r2, textvariable=self.output_var, bg=LIST_BG, fg=FG, font=("", 12)).pack(
-            side="left", fill="x", expand=True, padx=8
-        )
-        self._button(r2, "浏览…", self._pick_output).pack(side="left")
-
-        # --- ⑤ ---
-        self._button(self, "⑤ 确认并生成", self._run_splice, accent=True).pack(
-            pady=12
-        )
-
-    def _pick_contract(self) -> None:
-        path = filedialog.askopenfilename(
-            parent=self,
-            title="选择合同 PDF",
-            filetypes=[("PDF", "*.pdf"), ("All", "*.*")],
-        )
-        if not path:
-            self._set_banner("未选择合同（可再点 ①）", "info")
-            return
-        from splice_signature_pages import default_output_path
-
-        self.contract_path = Path(path)
-        self.contract_var.set(str(self.contract_path))
-        self.output_var.set(str(default_output_path(self.contract_path)))
-        self._set_banner(f"已选合同：{self.contract_path.name} → 请继续 ②", "ok")
-
-    def _add_signed(self) -> None:
-        paths = filedialog.askopenfilenames(
-            parent=self,
-            title="选择已签签字页 PDF（可多选）",
-            filetypes=[("PDF", "*.pdf"), ("All", "*.*")],
-        )
-        if not paths:
-            self._set_banner("未添加已签页（可再点 ②）", "info")
-            return
-        if self.signed_list.size() == 1 and self.signed_list.get(0).startswith("（"):
-            self.signed_list.delete(0, tk.END)
-        for p in paths:
-            path = Path(p)
-            if path not in self.signed_paths:
-                self.signed_paths.append(path)
-                self.signed_list.insert(tk.END, path.name)
-        self._set_banner(
-            f"已签文件 {len(self.signed_paths)} 份 → 现在可以点 ③ 定位", "ok"
-        )
-
-    def _clear_signed(self) -> None:
-        self.signed_paths.clear()
-        self.signed_list.delete(0, tk.END)
-        self.signed_list.insert(tk.END, "（这里会出现已选文件名）")
-        self._set_banner("已清空已签列表", "info")
-
-    def _pick_output(self) -> None:
-        from splice_signature_pages import default_output_path
-
-        path = filedialog.asksaveasfilename(
-            parent=self,
-            title="保存输出 PDF",
-            defaultextension=".pdf",
-            filetypes=[("PDF", "*.pdf")],
-            initialfile=(
-                default_output_path(self.contract_path).name
-                if self.contract_path
-                else "合同_已嵌签字页.pdf"
-            ),
-        )
-        if path:
-            self.output_var.set(path)
-
-    def _run_locate(self) -> None:
-        if not self.contract_path or not self.contract_path.is_file():
-            self._alert("还不能定位", "请先点 ① 选择合同 PDF")
-            return
-        if not self.signed_paths:
-            self._alert("还不能定位", "请先点 ② 添加至少一份已签签字页 PDF")
-            return
-
-        self._set_banner("正在定位，请稍候…", "info")
-        self.update_idletasks()
-
-        try:
-            from locate_signature_pages import DEFAULT_PATTERNS, load_patterns, locate
-
-            patterns = load_patterns(DEFAULT_PATTERNS)
-            result = locate(self.contract_path, self.signed_paths, patterns)
-        except Exception as exc:
-            self._alert("定位失败", f"{type(exc).__name__}: {exc}")
-            return
-
-        for c in result["candidates"]:
-            c["preview"] = []
-
-        self.candidates = result["candidates"]
-        self.cand_list.delete(0, tk.END)
-
-        if not self.candidates:
-            self.cand_list.insert(tk.END, "未找到自动候选 — 请在下方手动填写页码")
-            self.cmp_var.set(
-                f"S={result['signed_page_count']}｜无候选，请人工填页码"
-            )
-            self._set_banner(
-                "未找到候选页。请打开合同核对签字页页码，在 ④ 手动填写后点 ⑤",
-                "info",
-            )
-            return
-
-        for i, c in enumerate(self.candidates):
-            self.cand_list.insert(
-                tk.END,
-                f"{chr(ord('A') + i)}. 第 {c['start']}–{c['end']} 页｜"
-                f"{c['page_count']} 页｜置信度 {c['confidence']}｜"
-                f"{', '.join((c.get('signals') or [])[:3])}",
-            )
-
-        cmp_ = result["comparison"]
-        advice = {
-            "match": "页数一致，可确认后嵌回",
-            "contract_fewer": "定位页少于已签页，请检查是否漏页或扩大范围",
-            "contract_more": "定位页多于已签页，请缩小范围或补已签文件",
-            "no_candidate": "无自动候选",
-            "no_signed": "无已签页",
-        }.get(cmp_.get("status", ""), "")
-        self.cmp_var.set(
-            f"已签页数 S={result['signed_page_count']}｜{cmp_.get('status')} — {advice}"
-        )
-
-        self.cand_list.selection_set(0)
-        self._on_cand_select()
-        self._set_banner(
-            f"定位完成：{len(self.candidates)} 个候选。"
-            "请点击列表选一档，核对 ④ 页码后点 ⑤",
-            "ok",
-        )
-
-    def _on_cand_select(self, _event=None) -> None:
-        sel = self.cand_list.curselection()
-        if not sel or not self.candidates:
-            return
-        idx = sel[0]
-        if idx >= len(self.candidates):
-            return
-        c = self.candidates[idx]
-        self.range_var.set(
-            str(c["start"]) if c["start"] == c["end"] else f"{c['start']}-{c['end']}"
-        )
-
-    def _run_splice(self) -> None:
-        from pypdf import PdfReader, PdfWriter
-        from splice_signature_pages import parse_range, splice
-
-        if not self.contract_path or not self.contract_path.is_file():
-            self._alert("无法生成", "请先点 ① 选择合同 PDF")
-            return
-        if not self.signed_paths:
-            self._alert("无法生成", "请先点 ② 添加已签签字页")
-            return
-
-        range_text = self.range_var.get().strip()
-        if not range_text:
-            self._alert("无法生成", "请先点 ③ 定位并选择候选，或在 ④ 手动填写页码")
-            return
-        try:
-            start, end = parse_range(range_text.replace(" ", ""))
-        except ValueError as exc:
-            self._alert("页码无效", str(exc))
-            return
-
-        out_raw = self.output_var.get().strip()
-        if not out_raw:
-            self._alert("无法生成", "请填写输出路径")
-            return
-        output = Path(out_raw).expanduser()
-
-        cleanup: Path | None = None
-        if len(self.signed_paths) > 1:
-            ok = messagebox.askokcancel(
-                "多份已签 PDF",
-                "将把所有已签 PDF 合并后，替换合同该页码范围。\n"
-                "多段分别替换请用 CLI。\n\n是否继续？",
-                parent=self,
-            )
-            if not ok:
-                return
-            merged = output.parent / f".{output.stem}_signed_merged_tmp.pdf"
-            writer = PdfWriter()
-            for p in self.signed_paths:
-                for page in PdfReader(str(p)).pages:
-                    writer.add_page(page)
-            with merged.open("wb") as f:
-                writer.write(f)
-            signed_for_splice = merged
-            cleanup = merged
         else:
-            signed_for_splice = self.signed_paths[0]
-
-        confirm = messagebox.askyesno(
-            "确认嵌回",
-            f"合同：{self.contract_path.name}\n"
-            f"替换第 {start}–{end} 页\n"
-            f"输出：{output}\n\n不会覆盖原合同。是否继续？",
-            parent=self,
-        )
-        if not confirm:
-            if cleanup and cleanup.is_file():
-                cleanup.unlink(missing_ok=True)
-            self._set_banner("已取消生成", "info")
-            return
-
-        self._set_banner("正在嵌回…", "info")
-        self.update_idletasks()
-        report = None
-        try:
-            report = splice(
-                self.contract_path,
-                [(start, end, signed_for_splice)],
-                output,
+            contract_cards.append(
+                _card(contract_pngs.get(page_no), f"第 {page_no} 页", "上下文，保留不动", "context"),
             )
-        except SystemExit as exc:
-            self._alert("嵌回失败", str(exc))
-            return
-        except Exception as exc:
-            self._alert("嵌回失败", f"{type(exc).__name__}: {exc}")
-            return
-        finally:
-            if cleanup and cleanup.is_file():
-                cleanup.unlink(missing_ok=True)
 
-        if report is None:
-            return
+    import fitz
 
-        warn = "\n".join(report.get("warnings") or []) or "无"
-        self._set_banner(
-            f"完成：{report['output']}（{report['old_page_count']}→{report['new_page_count']} 页）",
-            "ok",
+    signed_cards: list[str] = []
+    insert_seq = 0
+    for f_idx, sp in enumerate(signed_paths, start=1):
+        blanks = set(signed_blank_map.get(sp, []))
+        with fitz.open(str(sp)) as doc:
+            page_total = doc.page_count
+        pngs = _render_page_pngs(sp, list(range(1, page_total + 1)), review_dir, f"s{f_idx}")
+        for page_no in range(1, page_total + 1):
+            if page_no in blanks:
+                signed_cards.append(
+                    _card(
+                        pngs.get(page_no),
+                        f"{sp.name} · 第 {page_no} 页",
+                        "判定为空白，不会插入",
+                        "blank",
+                    ),
+                )
+                continue
+            insert_seq += 1
+            signed_cards.append(
+                _card(
+                    pngs.get(page_no),
+                    f"{sp.name} · 第 {page_no} 页",
+                    f"将插入，替换后位置：第 {start + insert_seq - 1} 页",
+                    "insert",
+                ),
+            )
+
+    located = end - start + 1
+    if located == signed_total:
+        verdict_class, verdict = "ok", f"页数一致：待替换 {located} 页 = 已签 {signed_total} 页"
+    elif located < signed_total:
+        verdict_class, verdict = (
+            "warn",
+            f"待替换 {located} 页 少于 已签 {signed_total} 页；生成后总页数会增加 "
+            f"{signed_total - located} 页",
         )
-        messagebox.showinfo(
-            "完成",
-            f"已生成：\n{report['output']}\n\n"
-            f"页数：{report['old_page_count']} → {report['new_page_count']}\n"
-            f"警告：{warn}",
-            parent=self,
+    else:
+        verdict_class, verdict = (
+            "warn",
+            f"待替换 {located} 页 多于 已签 {signed_total} 页；生成后总页数会减少 "
+            f"{located - signed_total} 页",
         )
+
+    blank_total = sum(len(v) for v in signed_blank_map.values())
+    rows = [
+        ("合同文件", contract.name),
+        ("合同总页数", f"{contract_pages} 页"),
+        ("待替换页码", f"第 {start}–{end} 页（共 {located} 页）"),
+        ("已签文件", "、".join(p.name for p in signed_paths)),
+        ("实际插入页数", f"{signed_total} 页"),
+        ("空白页检测", f"已签文件中判定为空白并跳过 {blank_total} 页" if blank_total else "未发现空白页"),
+        ("输出文件", output.name if output else "下一步选择"),
+    ]
+    rows_html = "".join(
+        f"<tr><th>{html.escape(k)}</th><td>{html.escape(v)}</td></tr>" for k, v in rows
+    )
+
+    body = f"""<div class="panel"><table>{rows_html}</table></div>
+<div class="panel">
+  <h2>合同中将被替换的页</h2>
+  <p class="hint">红框为将被替换的空白签字页；灰色为前后相邻页，仅供确认位置，不会改动。</p>
+  <div class="grid">{"".join(contract_cards)}</div>
+</div>
+<div class="panel">
+  <h2>将插入的已签签字页</h2>
+  <p class="hint">蓝框按插入顺序排列；虚线灰框为判定为空白的页，不会插入。</p>
+  <div class="grid">{"".join(signed_cards)}</div>
+</div>"""
+    review_html = review_dir / "review.html"
+    review_html.write_text(
+        _html_document("步骤 4 · 核对待替换签字页", verdict_class, verdict, body, locate_note),
+        encoding="utf-8",
+    )
+    return review_html
+
+
+def build_blank_review_page(
+    *,
+    review_dir: Path,
+    signed_paths: list[Path],
+    metrics_map: dict[Path, list[dict]],
+    blank_map: dict[Path, list[int]],
+) -> Path:
+    """Write blank.html showing every signed page and its blank/keep verdict."""
+    for stale in review_dir.glob("*.png"):
+        stale.unlink(missing_ok=True)
+
+    sections: list[str] = []
+    total_pages = 0
+    total_blank = 0
+    for f_idx, sp in enumerate(signed_paths, start=1):
+        metrics = metrics_map.get(sp, [])
+        blanks = set(blank_map.get(sp, []))
+        total_pages += len(metrics)
+        total_blank += len(blanks)
+        pngs = _render_page_pngs(
+            sp, [m["page"] for m in metrics], review_dir, f"b{f_idx}",
+        )
+        cards: list[str] = []
+        for m in metrics:
+            page_no = m["page"]
+            ink = "—" if m["ink_ratio"] is None else f"{m['ink_ratio']:.3%}"
+            detail = f"墨迹 {ink}｜文字 {m['nonspace_len']} 字"
+            if page_no in blanks:
+                cards.append(
+                    _card(pngs.get(page_no), f"第 {page_no} 页 · 移除", detail, "blank"),
+                )
+            else:
+                cards.append(
+                    _card(pngs.get(page_no), f"第 {page_no} 页 · 保留", detail, "insert"),
+                )
+        blank_text = "、".join(str(p) for p in sorted(blanks)) if blanks else "无"
+        sections.append(
+            f'<div class="panel"><h2>{html.escape(sp.name)}</h2>'
+            f'<p class="hint">共 {len(metrics)} 页；判定为空白：{html.escape(blank_text)}。'
+            f"蓝框保留并插入，虚线灰框视为空白不插入。</p>"
+            f'<div class="grid">{"".join(cards)}</div></div>',
+        )
+
+    keep = total_pages - total_blank
+    if total_blank:
+        verdict_class = "ok"
+        verdict = f"判定为空白 {total_blank} 页，将插入 {keep} 页（共 {total_pages} 页）"
+    else:
+        verdict_class = "warn"
+        verdict = f"未判定出空白页，将插入全部 {total_pages} 页"
+
+    blank_html = review_dir / "blank.html"
+    blank_html.write_text(
+        _html_document(
+            "步骤 2 · 核对空白页判定",
+            verdict_class,
+            verdict,
+            "".join(sections),
+            "判定可人工调整：回到对话框选「手动调整」，直接填写要移除的页码。",
+        ),
+        encoding="utf-8",
+    )
+    return blank_html
+
+
+# --- Wizard ----------------------------------------------------------------
+
+
+def parse_range_text(text: str) -> tuple[int, int]:
+    from splice_signature_pages import parse_range
+
+    return parse_range(text.replace(" ", "").replace("–", "-").replace("—", "-"))
+
+
+def review_blank_pages(
+    blank_dir: Path,
+    signed_paths: list[Path],
+    metrics_map: dict[Path, list[dict]],
+    blank_map: dict[Path, list[int]],
+    title: str,
+) -> dict[Path, list[int]]:
+    """Show the blank-page verdicts and let the user correct them by page number."""
+    from blank_page_detector import parse_page_list
+
+    current = {sp: list(pages) for sp, pages in blank_map.items()}
+    while True:
+        page = build_blank_review_page(
+            review_dir=blank_dir,
+            signed_paths=signed_paths,
+            metrics_map=metrics_map,
+            blank_map=current,
+        )
+        subprocess.run(["open", str(page)], check=False)
+        removed = sum(len(v) for v in current.values())
+        total = sum(len(metrics_map[sp]) for sp in signed_paths)
+        _log(f"步骤 2 核对：空白判定页已在浏览器打开（移除 {removed} 页）", "ok")
+
+        choice = ask_buttons(
+            "步骤 2 核对：浏览器已打开空白页判定结果。\n\n"
+            f"共 {total} 页，判定为空白 {removed} 页，将插入 {total - removed} 页。\n\n"
+            "判定不对可以手动改。",
+            ["手动调整", "取消", "判定正确"],
+            "判定正确",
+            title,
+        )
+        if choice == "判定正确":
+            return current
+        if choice == "取消":
+            raise UserCancelled()
+
+        for sp in signed_paths:
+            page_total = len(metrics_map[sp])
+            existing = ",".join(str(p) for p in current.get(sp, []))
+            answer = ask_text(
+                f"{sp.name}（共 {page_total} 页）\n\n"
+                "填写要当作空白、不插入的页码，例如 3,5 或 2-3。\n"
+                "留空表示这份文件全部页都插入。",
+                existing,
+                title,
+            )
+            try:
+                current[sp] = parse_page_list(answer, max_page=page_total)
+            except ValueError as exc:
+                alert(f"{sp.name}：{exc}\n本文件判定保持不变。", title)
+
+
+def run_wizard(review_dir: Path) -> int:
+    from blank_page_detector import page_metrics
+    from locate_signature_pages import DEFAULT_PATTERNS, load_patterns, locate
+    from pypdf import PdfReader, PdfWriter
+    from splice_signature_pages import default_output_path, splice
+
+    title = f"嵌回签字页 · {UI_BUILD}"
+    blank_dir = review_dir / "blank"
+    step4_dir = review_dir / "step4"
+    blank_dir.mkdir(parents=True, exist_ok=True)
+    step4_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. Contract
+    contract = choose_pdf("步骤 1：选择合同 PDF（含待替换的空白签字页）")
+    contract_pages = len(PdfReader(str(contract)).pages)
+    _log(f"步骤 1 完成：{contract.name}（{contract_pages} 页）", "ok")
+
+    # 2. Signed pages
+    signed_paths = choose_pdfs("步骤 2：选择已签字的签字页 PDF（可多选）")
+    if not signed_paths:
+        alert("没有选择已签字的签字页，流程结束。", title)
+        return 1
+    clean_blank = ask_buttons(
+        f"已选 {len(signed_paths)} 份已签文件。\n\n"
+        "双面扫描常会多出空白页。是否自动跳过判定为空白的页？\n"
+        "（下一步可以看图核对，并手动改判定）",
+        ["保留全部页", "自动跳过空白页"],
+        "自动跳过空白页",
+        title,
+    ) == "自动跳过空白页"
+
+    metrics_map: dict[Path, list[dict]] = {sp: page_metrics(sp) for sp in signed_paths}
+    signed_blank_map: dict[Path, list[int]] = {
+        sp: ([m["page"] for m in metrics_map[sp] if m["blank"]] if clean_blank else [])
+        for sp in signed_paths
+    }
+    if clean_blank:
+        signed_blank_map = review_blank_pages(
+            blank_dir, signed_paths, metrics_map, signed_blank_map, title,
+        )
+    signed_total = sum(
+        len(metrics_map[sp]) - len(signed_blank_map.get(sp, [])) for sp in signed_paths
+    )
+    _log(
+        f"步骤 2 完成：{len(signed_paths)} 份，"
+        f"移除空白 {sum(len(v) for v in signed_blank_map.values())} 页，"
+        f"将插入 {signed_total} 页",
+        "ok",
+    )
+
+    # 3. Locate
+    result = locate(
+        contract,
+        signed_paths,
+        load_patterns(DEFAULT_PATTERNS),
+        clean_signed_blank_pages=clean_blank,
+    )
+    candidates = result["candidates"]
+    _log(f"步骤 3 完成：{len(candidates)} 个候选，已签实际 {signed_total} 页", "ok")
+
+    manual_label = "手动输入页码…"
+    range_text = ""
+    if candidates:
+        options = [
+            f"{chr(ord('A') + i)}. 第 {c['start']}–{c['end']} 页｜{c['page_count']} 页｜"
+            f"置信度 {c['confidence']}"
+            for i, c in enumerate(candidates)
+        ] + [manual_label]
+        picked = choose_from_list(
+            options,
+            f"步骤 3：选择要被替换的签字页（已签实际 {signed_total} 页）",
+            title,
+        )
+        if picked != manual_label:
+            c = candidates[options.index(picked)]
+            range_text = (
+                str(c["start"]) if c["start"] == c["end"] else f"{c['start']}-{c['end']}"
+            )
+
+    # 4. Review, with the option to correct the range and look again
+    while True:
+        if not range_text:
+            range_text = ask_text(
+                f"步骤 4：填写要被替换的合同页码（1–{contract_pages}）。\n"
+                "例如 12 或 12-13。",
+                range_text or "",
+                title,
+            )
+        try:
+            start, end = parse_range_text(range_text)
+        except ValueError as exc:
+            alert(f"页码无效：{exc}", title)
+            range_text = ""
+            continue
+        if end > contract_pages:
+            alert(f"页码超出范围：合同只有 {contract_pages} 页。", title)
+            range_text = ""
+            continue
+
+        review_html = build_review_page(
+            review_dir=step4_dir,
+            contract=contract,
+            contract_pages=contract_pages,
+            start=start,
+            end=end,
+            signed_paths=signed_paths,
+            signed_blank_map=signed_blank_map,
+            signed_total=signed_total,
+            output=None,
+            locate_note=str(result.get("note") or ""),
+        )
+        subprocess.run(["open", str(review_html)], check=False)
+        _log(f"步骤 4：核对页已在浏览器打开（第 {start}–{end} 页）", "ok")
+
+        located = end - start + 1
+        choice = ask_buttons(
+            f"步骤 4 核对：浏览器已打开核对页。\n\n"
+            f"将替换：第 {start}–{end} 页（{located} 页）\n"
+            f"将插入：{signed_total} 页\n\n"
+            "确认无误后继续生成。",
+            ["改页码", "取消", "确认并生成"],
+            "确认并生成",
+            title,
+        )
+        if choice == "确认并生成":
+            break
+        if choice == "取消":
+            _log("用户在步骤 4 取消", "info")
+            return 1
+        range_text = ""
+
+    # 5. Output path, splice
+    default_out = default_output_path(contract)
+    output = ask_save_path(default_out.name, contract.parent, "步骤 5：选择输出位置")
+
+    # The reviewed decision is authoritative: pages dropped here are never
+    # re-detected inside splice.
+    removed_blank = sum(len(v) for v in signed_blank_map.values())
+    if len(signed_paths) > 1:
+        merged_tmp = review_dir / "signed_merged.pdf"
+        writer = PdfWriter()
+        for sp in signed_paths:
+            blanks = set(signed_blank_map.get(sp, []))
+            for page_no, page in enumerate(PdfReader(str(sp)).pages, start=1):
+                if page_no not in blanks:
+                    writer.add_page(page)
+        with merged_tmp.open("wb") as f:
+            writer.write(f)
+        signed_for_splice = merged_tmp
+        blank_pages_arg = {merged_tmp: []}
+    else:
+        signed_for_splice = signed_paths[0]
+        blank_pages_arg = {signed_for_splice: signed_blank_map.get(signed_for_splice, [])}
+
+    try:
+        report = splice(
+            contract,
+            [(start, end, signed_for_splice)],
+            output,
+            clean_signed_blank_pages=clean_blank,
+            signed_blank_pages=blank_pages_arg,
+        )
+    except SystemExit as exc:
+        alert(f"生成失败：{exc}", title)
+        return 1
+    except Exception as exc:
+        alert(f"生成失败：{type(exc).__name__}: {exc}", title)
+        return 1
+
+    warnings = report.get("warnings") or []
+    _log(f"步骤 5 完成：{report['output']}", "ok")
+
+    summary = (
+        f"已生成：{Path(report['output']).name}\n\n"
+        f"页数：{report['old_page_count']} → {report['new_page_count']}\n"
+        f"跳过的空白已签页：{removed_blank} 页\n"
+        f"提示：{('；'.join(warnings)) if warnings else '无'}"
+    )
+    action = ask_buttons(summary, ["在 Finder 中显示", "完成", "打开 PDF"], "打开 PDF", title)
+    if action == "打开 PDF":
+        subprocess.run(["open", str(output)], check=False)
+    elif action == "在 Finder 中显示":
+        subprocess.run(["open", "-R", str(output)], check=False)
+    return 0
 
 
 def main() -> int:
+    print(f"[replace-signature-pages] {UI_BUILD}", flush=True)
+    print(f"[replace-signature-pages] loaded from: {Path(__file__).resolve()}", flush=True)
+
+    review_dir = Path(tempfile.mkdtemp(prefix="sigpage-review-"))
     try:
-        app = App()
-        app.mainloop()
-    except Exception as exc:
-        try:
-            root = tk.Tk()
-            root.withdraw()
-            messagebox.showerror("启动失败", f"{type(exc).__name__}: {exc}")
-            root.destroy()
-        except Exception:
-            print(f"启动失败: {exc}", file=sys.stderr)
+        return run_wizard(review_dir)
+    except UserCancelled:
+        _log("已取消", "info")
         return 1
-    return 0
+    except Exception as exc:
+        _log(f"{type(exc).__name__}: {exc}", "err")
+        alert(f"出错了：{type(exc).__name__}: {exc}")
+        return 1
+    finally:
+        shutil.rmtree(review_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":

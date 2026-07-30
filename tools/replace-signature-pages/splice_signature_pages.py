@@ -19,6 +19,8 @@ except ImportError:
     )
     sys.exit(1)
 
+from blank_page_detector import detect_blank_pages
+
 
 def parse_range(spec: str) -> tuple[int, int]:
     """Parse '12' or '12-13' as 1-based inclusive page numbers."""
@@ -58,7 +60,19 @@ def splice(
     contract: Path,
     replacements: list[tuple[int, int, Path]],
     output: Path,
+    *,
+    clean_signed_blank_pages: bool = False,
+    signed_blank_nonspace_threshold: int = 15,
+    signed_blank_content_bytes_max: int = 800,
+    signed_blank_pages: dict[Path, list[int]] | None = None,
 ) -> dict[str, Any]:
+    """Replace contract page ranges with signed pages.
+
+    `signed_blank_pages` maps a signed PDF to the 1-based pages to drop. When a
+    signed file appears there its list is authoritative (that is how a
+    user-reviewed decision reaches this step); otherwise blank pages are
+    detected only if `clean_signed_blank_pages` is set.
+    """
     if output.resolve() == contract.resolve():
         raise SystemExit(
             "Refusing to overwrite the contract. Choose a different --output path."
@@ -108,7 +122,21 @@ def splice(
                 signed_reader.decrypt("")
             except Exception as exc:
                 raise SystemExit(f"Signed PDF encrypted: {signed_path}: {exc}") from exc
-        signed_pages = list(signed_reader.pages)
+        signed_pages_all = list(signed_reader.pages)
+
+        removed_blank_pages: list[int] = []
+        if signed_blank_pages is not None and signed_path in signed_blank_pages:
+            removed_blank_pages = sorted(signed_blank_pages[signed_path])
+        elif clean_signed_blank_pages:
+            removed_blank_pages = detect_blank_pages(
+                signed_path,
+                nonspace_threshold=signed_blank_nonspace_threshold,
+                content_bytes_max=signed_blank_content_bytes_max,
+            )
+        blank_set = set(removed_blank_pages)
+        signed_pages = [
+            p for idx, p in enumerate(signed_pages_all, start=1) if idx not in blank_set
+        ]
         s_count = len(signed_pages)
         if s_count == 0:
             raise SystemExit(f"Signed PDF has 0 pages: {signed_path}")
@@ -140,6 +168,10 @@ def splice(
                 "inserted_pages": s_count,
                 "signed": str(signed_path),
                 "mode": "equal" if l_count == s_count else ("expand" if s_count > l_count else "shrink"),
+                "removed_blank_signed_pages": len(removed_blank_pages),
+                "removed_blank_signed_page_indices": (
+                    removed_blank_pages[:12] if removed_blank_pages else []
+                ),
             }
         )
 
@@ -191,6 +223,23 @@ def main() -> int:
         help="Output PDF (default: <contract>_已嵌签字页.pdf)",
     )
     parser.add_argument("--json", action="store_true", help="Print JSON report only")
+    parser.add_argument(
+        "--clean-signed-blank-pages",
+        action="store_true",
+        help="Remove疑似空白页 from signed PDFs before inserting.",
+    )
+    parser.add_argument(
+        "--signed-blank-nonspace-threshold",
+        type=int,
+        default=15,
+        help="If extracted text has <= this many non-space chars, it may be blank.",
+    )
+    parser.add_argument(
+        "--signed-blank-content-bytes-max",
+        type=int,
+        default=800,
+        help="If content stream bytes <= this and no image XObjects, treat as blank.",
+    )
     args = parser.parse_args()
 
     if not args.contract.is_file():
@@ -219,7 +268,14 @@ def main() -> int:
 
     output = args.output or default_output_path(args.contract)
     try:
-        report = splice(args.contract, replacements, output)
+        report = splice(
+            args.contract,
+            replacements,
+            output,
+            clean_signed_blank_pages=args.clean_signed_blank_pages,
+            signed_blank_nonspace_threshold=args.signed_blank_nonspace_threshold,
+            signed_blank_content_bytes_max=args.signed_blank_content_bytes_max,
+        )
     except SystemExit as exc:
         print(str(exc), file=sys.stderr)
         return 1

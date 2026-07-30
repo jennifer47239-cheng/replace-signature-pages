@@ -11,11 +11,42 @@ Skill 说明：`.cursor/skills/replace-signature-pages/SKILL.md`
 
 ## [Unreleased]
 
+### Fixed
+
+- 空白页判定对**扫描件无效**：扫描页整页是一张图片，`_count_image_xobjects() > 0`
+  会直接判为「有内容」，导致双面扫描的空白背面永远检测不出来。
+  改为在可用 `pymupdf` 时按**渲染后的墨迹比例**判定（默认 ≤ 0.2% 视为空白），
+  无 `pymupdf` 时回退到原文字/内容流规则。
+
+### Added
+
+- `blank_page_detector.py` 新增逐页判定报告 CLI：`--pdf` 列出每页文字字数、
+  图像数、内容流字节、墨迹比例与判定依据；支持 `--ink-ratio-max` 调阈值、
+  `--force-blank/--force-keep` 手动改判定、`--clean-to` 写出去空白页的新 PDF、
+  `--json`。报告只输出数字，不打印页面文字。
+- `page_metrics()` / `detect_blank_pages()` / `resolve_blank_pages()` /
+  `parse_page_list()`：供 GUI 与 CLI 共用的判定与人工覆盖接口。
+- GUI 步骤 2 新增**空白页判定核对页**：逐页缩略图 + 墨迹比例，可选「手动调整」
+  按文件填写要当作空白的页码，改完重新出图；人工结果优先。
+- `splice()` 新增 `signed_blank_pages` 参数：传入即以该列表为准，不再自动检测，
+  确保人工核对结果不被覆盖。
+
+### Changed
+
+- `gui.py` 改为**原生 macOS 向导**：AppleScript 对话框（选文件 / 选候选 / 确认 / 保存）
+  取代 Tk 界面；步骤 4 核对改为浏览器中的可视核对页（页面缩略图、L/S 页数比对、
+  空白页检测结果），缩略图写入临时目录并在退出时删除。
+  原因：本机为 Apple 系统 Tk 8.5.9（Python 3.9.6 / macOS 26），Tk 自绘控件
+  （Label / Entry / Listbox / LabelFrame）完全不绘制，只有原生按钮可见，
+  导致步骤 4 及所有文字无法显示。
+
 ### Planned
 
 - 纸质插页 / 双面打印隔页作业单（流程 B，尚未实现）
 - 批量多合同处理
 - OCR 辅助定位（扫描件无文本层）
+- 疑似空白已签页自动检测与移除（双面扫描常见），并在 locate/splice 阶段同步 L/S（已实现）
+- GUI 上传界面优化：显示页数、已签文件上/下调序、空白页自动移除开关（默认开启）（已实现）
 
 ---
 

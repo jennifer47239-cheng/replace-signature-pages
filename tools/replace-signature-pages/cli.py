@@ -180,9 +180,20 @@ def run_interactive(
         print(f"patterns.json 不存在: {patterns_path}", file=sys.stderr)
         return 1
 
+    clean_blank_default = "y"
+    raw = input(
+        "\n疑似空白页（双面扫描回传常见）是否自动移除？(默认 y，输入 n 关闭): "
+    ).strip().lower()
+    clean_blank = raw in {"", "y", "yes", "是"} if raw != "n" else False
+
     print("\n正在定位签字页候选（只读）…")
     patterns = load_patterns(patterns_path)
-    result = locate(contract, signed, patterns)
+    result = locate(
+        contract,
+        signed,
+        patterns,
+        clean_signed_blank_pages=clean_blank,
+    )
     if not show_preview:
         for c in result["candidates"]:
             c["preview"] = []
@@ -225,7 +236,12 @@ def run_interactive(
         return 1
 
     try:
-        report = splice(contract, replacements, out)
+        report = splice(
+            contract,
+            replacements,
+            out,
+            clean_signed_blank_pages=clean_blank,
+        )
     except SystemExit as exc:
         print(str(exc), file=sys.stderr)
         return 1

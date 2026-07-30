@@ -23,6 +23,8 @@ except ImportError:
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_PATTERNS = SCRIPT_DIR / "patterns.json"
 
+from blank_page_detector import count_non_blank_pages
+
 
 def load_patterns(path: Path) -> dict[str, Any]:
     with path.open(encoding="utf-8") as f:
@@ -205,7 +207,15 @@ def compare_l_s(candidates: list[dict[str, Any]], signed_pages: int) -> dict[str
     }
 
 
-def locate(contract: Path, signed: list[Path], patterns: dict[str, Any]) -> dict[str, Any]:
+def locate(
+    contract: Path,
+    signed: list[Path],
+    patterns: dict[str, Any],
+    *,
+    clean_signed_blank_pages: bool = False,
+    signed_blank_nonspace_threshold: int = 15,
+    signed_blank_content_bytes_max: int = 800,
+) -> dict[str, Any]:
     reader = PdfReader(str(contract))
     total = len(reader.pages)
     weights = patterns["weights"]
@@ -231,15 +241,33 @@ def locate(contract: Path, signed: list[Path], patterns: dict[str, Any]) -> dict
     candidates = merge_candidates(page_scores, merge_floor)
     candidates = [c for c in candidates if c["avg_score"] >= min_score]
 
-    signed_total = sum(page_count(p) for p in signed) if signed else 0
+    signed_total = 0
+    signed_cleaning_details: list[dict[str, Any]] = []
+    if signed:
+        if clean_signed_blank_pages:
+            for sp in signed:
+                info = count_non_blank_pages(
+                    sp,
+                    nonspace_threshold=signed_blank_nonspace_threshold,
+                    content_bytes_max=signed_blank_content_bytes_max,
+                )
+                signed_total += int(info["non_blank_page_count"])
+                signed_cleaning_details.append(info)
+        else:
+            signed_total = sum(page_count(p) for p in signed)
     comparison = compare_l_s(candidates, signed_total)
 
     low_text_pages = [p["page"] for p in page_scores if p["low_text"]]
+    removed_blank_total = sum(
+        int(d.get("blank_page_count", 0)) for d in signed_cleaning_details
+    )
     return {
         "contract": str(contract),
         "total_pages": total,
         "signed_files": [str(p) for p in signed],
         "signed_page_count": signed_total,
+        "signed_blank_removed_page_count": removed_blank_total,
+        "signed_cleaning_details": signed_cleaning_details,
         "candidates": candidates,
         "comparison": comparison,
         "low_text_page_count": len(low_text_pages),
@@ -269,6 +297,23 @@ def main() -> int:
     )
     parser.add_argument("--json", action="store_true", help="Print JSON only")
     parser.add_argument(
+        "--clean-signed-blank-pages",
+        action="store_true",
+        help="Remove疑似空白页 from signed PDFs before counting L/S.",
+    )
+    parser.add_argument(
+        "--signed-blank-nonspace-threshold",
+        type=int,
+        default=15,
+        help="If extracted text has <= this many non-space chars, it may be treated as blank.",
+    )
+    parser.add_argument(
+        "--signed-blank-content-bytes-max",
+        type=int,
+        default=800,
+        help="If the page content stream bytes <= this value and has no image XObjects, treat as blank.",
+    )
+    parser.add_argument(
         "--redact-preview",
         action="store_true",
         help="Omit page text previews from output (safer for unredacted contracts)",
@@ -287,7 +332,14 @@ def main() -> int:
         return 1
 
     patterns = load_patterns(args.patterns)
-    result = locate(args.contract, args.signed, patterns)
+    result = locate(
+        args.contract,
+        args.signed,
+        patterns,
+        clean_signed_blank_pages=args.clean_signed_blank_pages,
+        signed_blank_nonspace_threshold=args.signed_blank_nonspace_threshold,
+        signed_blank_content_bytes_max=args.signed_blank_content_bytes_max,
+    )
     if args.redact_preview:
         for c in result.get("candidates", []):
             c["preview"] = []
