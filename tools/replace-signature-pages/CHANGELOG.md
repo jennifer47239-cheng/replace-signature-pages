@@ -13,10 +13,32 @@ Skill 说明：`.cursor/skills/replace-signature-pages/SKILL.md`
 
 ### Planned
 
-- 纸质插页 / 双面打印隔页作业单（流程 B，尚未实现）
 - 批量多合同处理
-- OCR 辅助定位（扫描件无文本层）
+- OCR 辅助定位（扫描件无文本层；可借用通用 PDF/OCR skill 作底层，决策仍归本工具）
 - 图形向导支持一次替换多个不连续区间（当前需用 CLI）
+
+### Added
+
+- 流程 B GUI：**浏览器缩略图核对页**（去掉的签字页 / 前后相邻页 / 空白隔页示意 + 双面打印顺序芯片）
+
+---
+
+## [0.4.0] - 2026-08-03
+
+流程 B：纸质湿签双面打印包（去签字页 + 隔页），形成相对 DocuSign / 通用 PDF skill 的差异化能力。
+
+### Added
+
+- `prepare_print_packet.py`：确认签字页区间后生成
+  - `<stem>_打印正文_去签字页.pdf`（去掉签字页；奇数前页接合处插 1 空白隔页）
+  - `<stem>_签字页_待签署.pdf`
+  - `<stem>_打印作业说明.md` / `.json`
+- CLI `--mode splice|print-packet`；GUI 启动时选择「嵌回电子版」或「双面打印包」
+- Skill / README 产品叙事：纸电双轨、隐私本机、人在回路；通用 PDF skill 仅作编排层底层能力
+
+### Changed
+
+- CHANGELOG 原「流程 B 尚未实现」项落地为 0.4.0
 
 ---
 
@@ -125,4 +147,5 @@ Skill 说明：`.cursor/skills/replace-signature-pages/SKILL.md`
 | 0.1.0 | 2026-07-24 | Skill + locate/splice 脚本 MVP |
 | 0.2.0 | 2026-07-24 | 迁至 tools/ + CLI/GUI + 隐私优先 |
 | 0.3.0 | 2026-07-30 | 扫描件空白页按墨迹判定 + 原生向导 + 两处人工核对 |
-| Unreleased | — | 打印作业单 / OCR / 批量（规划中） |
+| 0.4.0 | 2026-08-03 | 流程 B 双面打印包（去签字页 + 隔页） |
+| Unreleased | — | OCR / 批量（规划中） |

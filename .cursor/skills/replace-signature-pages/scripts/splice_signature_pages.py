@@ -12,5 +12,6 @@ _TARGET = _REPO / "tools" / "replace-signature-pages" / "splice_signature_pages.
 if not _TARGET.is_file():
     sys.stderr.write(f"Canonical script not found: {_TARGET}\n")
     sys.exit(1)
+sys.path.insert(0, str(_TARGET.parent))
 sys.argv[0] = str(_TARGET)
 runpy.run_path(str(_TARGET), run_name="__main__")

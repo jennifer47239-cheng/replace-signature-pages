@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Local wizard: pick PDFs → locate → visually review → confirm splice (no AI).
+"""Local wizard: Flow A (splice) or Flow B (duplex print packet). No AI.
 
 Apple's system Tk (8.5.9) does not paint Tk-owned widgets on current macOS, so
 the UI is built from AppleScript dialogs plus an HTML review page opened in the
@@ -20,7 +20,7 @@ if str(TOOL_DIR) not in sys.path:
     sys.path.insert(0, str(TOOL_DIR))
 
 # If dialogs lack this stamp in their title, you are not running this file.
-UI_BUILD = "ui-20260730-native"
+UI_BUILD = "ui-20260803-print-review"
 
 
 class UserCancelled(Exception):
@@ -153,6 +153,15 @@ figcaption span { color: #6E6E73; font-size: 12px; }
 .card.insert figcaption { background: #EDF5FF; }
 .card.blank { border-style: dashed; border-color: #AEAEB2; opacity: .62; }
 .card.blank figcaption { background: #F5F5F7; }
+.card.pad { border-style: dashed; border-color: #AF52DE; }
+.card.pad figcaption { background: #F8F0FF; }
+.card.pad .missing { background: #FAF5FF; color: #6E6E73; }
+.seq { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.seq .chip { padding: 8px 12px; border-radius: 8px; background: #F0F0F2; font-size: 13px; }
+.seq .chip.remove { background: #FFF0EF; color: #C62828; text-decoration: line-through; }
+.seq .chip.pad { background: #F8F0FF; color: #6A1B9A; border: 1px dashed #AF52DE; }
+.seq .chip.keep { background: #E3F6E8; color: #1B5E20; }
+.seq .arrow { color: #86868B; }
 footer { color: #86868B; font-size: 12px; margin-top: 32px; }
 """
 
@@ -377,6 +386,185 @@ def build_blank_review_page(
     return blank_html
 
 
+def build_print_packet_review_page(
+    *,
+    review_dir: Path,
+    contract: Path,
+    contract_pages: int,
+    start: int,
+    end: int,
+    locate_note: str = "",
+) -> Path:
+    """Write print-review.html: pages to strip, neighbors, and duplex blank pad."""
+    for stale in review_dir.glob("*.png"):
+        stale.unlink(missing_ok=True)
+
+    from prepare_print_packet import needs_duplex_pad
+
+    target_pages = list(range(start, end + 1))
+    before = start - 1
+    after = end + 1
+    context_pages = [p for p in (before, after) if 1 <= p <= contract_pages]
+    will_pad = needs_duplex_pad(start) and after <= contract_pages
+
+    try:
+        contract_pngs = _render_page_pngs(
+            contract,
+            sorted(set(target_pages + context_pages)),
+            review_dir,
+            "p",
+        )
+        render_ok = True
+    except Exception as exc:  # noqa: BLE001
+        _log(f"缩略图渲染失败（需 pymupdf）：{exc}", "err")
+        contract_pngs = {}
+        render_ok = False
+
+    contract_cards: list[str] = []
+    # Show in reading order: before → removed block → [pad marker] → after
+    if before >= 1:
+        contract_cards.append(
+            _card(
+                contract_pngs.get(before),
+                f"第 {before} 页",
+                "签字页前一页 · 保留在打印正文",
+                "context",
+            ),
+        )
+    for page_no in target_pages:
+        contract_cards.append(
+            _card(
+                contract_pngs.get(page_no),
+                f"第 {page_no} 页",
+                "将从正文去掉 · 抽到「待签署签字页」",
+                "replace",
+            ),
+        )
+    if will_pad:
+        contract_cards.append(
+            _card(
+                None,
+                "空白隔页",
+                f"插在原第 {before} 页之后，避免与第 {after} 页打到同一张纸正反面",
+                "pad",
+            ),
+        )
+    if after <= contract_pages:
+        contract_cards.append(
+            _card(
+                contract_pngs.get(after),
+                f"第 {after} 页",
+                "签字页后一页 · 保留在打印正文",
+                "context",
+            ),
+        )
+
+    # Sequence chips: original junction vs print body
+    remove_label = (
+        f"第 {start} 页"
+        if start == end
+        else f"第 {start}–{end} 页"
+    )
+    orig_chips = []
+    if before >= 1:
+        orig_chips.append(f'<span class="chip keep">原第 {before} 页</span>')
+        orig_chips.append('<span class="arrow">→</span>')
+    orig_chips.append(f'<span class="chip remove">{html.escape(remove_label)}（去掉）</span>')
+    if after <= contract_pages:
+        orig_chips.append('<span class="arrow">→</span>')
+        orig_chips.append(f'<span class="chip keep">原第 {after} 页</span>')
+
+    body_chips = []
+    if before >= 1:
+        side = "正面" if before % 2 == 1 else "背面"
+        body_chips.append(f'<span class="chip keep">原第 {before} 页（{side}）</span>')
+        body_chips.append('<span class="arrow">→</span>')
+    if will_pad:
+        body_chips.append(
+            f'<span class="chip pad">空白隔页'
+            f'（{"背面" if before % 2 == 1 else "正面"}）</span>'
+        )
+        body_chips.append('<span class="arrow">→</span>')
+    if after <= contract_pages:
+        # After pad (or if no pad and before even), after starts new sheet front
+        if will_pad or before < 1 or before % 2 == 0:
+            after_side = "新张正面"
+        else:
+            after_side = "背面（有碰撞风险，本应已插隔页）"
+        body_chips.append(
+            f'<span class="chip keep">原第 {after} 页（{after_side}）</span>'
+        )
+
+    removed_count = end - start + 1
+    if will_pad:
+        verdict_class, verdict = (
+            "ok",
+            f"将去掉签字页 {removed_count} 页，并在原第 {before} 页后插入 1 页空白隔页",
+        )
+    elif before >= 1 and after <= contract_pages:
+        verdict_class, verdict = (
+            "ok",
+            f"将去掉签字页 {removed_count} 页；接合处无需隔页"
+            f"（原第 {before} 页已是偶数背面）",
+        )
+    else:
+        verdict_class, verdict = (
+            "ok",
+            f"将去掉签字页 {removed_count} 页（位于文件首/尾，无双面接合）",
+        )
+
+    if not render_ok:
+        verdict_class = "warn"
+        verdict += "｜缩略图未生成：请 pip install pymupdf 后重试"
+
+    rows = [
+        ("合同文件", contract.name),
+        ("合同总页数", f"{contract_pages} 页"),
+        ("去掉的签字页", f"第 {start}–{end} 页（共 {removed_count} 页）"),
+        ("双面隔页", "是，插入 1 页" if will_pad else "否"),
+        (
+            "打印正文页数",
+            f"{contract_pages - removed_count + (1 if will_pad else 0)} 页"
+            f"（原 {contract_pages} − {removed_count}"
+            f"{' + 1 隔页' if will_pad else ''}）",
+        ),
+        ("待签署签字页", f"{removed_count} 页（单独打印）"),
+    ]
+    rows_html = "".join(
+        f"<tr><th>{html.escape(k)}</th><td>{html.escape(v)}</td></tr>" for k, v in rows
+    )
+
+    body = f"""<div class="panel"><table>{rows_html}</table></div>
+<div class="panel">
+  <h2>接合处示意（原合同）</h2>
+  <p class="hint">红删除线为将去掉的签字页；绿为保留页。</p>
+  <div class="seq">{"".join(orig_chips)}</div>
+</div>
+<div class="panel">
+  <h2>双面打印正文顺序（生成后）</h2>
+  <p class="hint">紫虚线为空白隔页，用于把「前一页」与「后一页」拆到不同纸张。</p>
+  <div class="seq">{"".join(body_chips) if body_chips else '<span class="chip">（无后续正文接合）</span>'}</div>
+</div>
+<div class="panel">
+  <h2>页缩略图</h2>
+  <p class="hint">红框＝去掉并抽到待签署 PDF；灰框＝保留在打印正文；紫虚线＝将插入的空白隔页。</p>
+  <div class="grid">{"".join(contract_cards)}</div>
+</div>"""
+
+    review_html = review_dir / "print-review.html"
+    review_html.write_text(
+        _html_document(
+            "流程 B · 核对双面打印包",
+            verdict_class,
+            verdict,
+            body,
+            locate_note or "确认无误后回到对话框点「确认并生成」。",
+        ),
+        encoding="utf-8",
+    )
+    return review_html
+
+
 # --- Wizard ----------------------------------------------------------------
 
 
@@ -436,6 +624,126 @@ def review_blank_pages(
                 current[sp] = parse_page_list(answer, max_page=page_total)
             except ValueError as exc:
                 alert(f"{sp.name}：{exc}\n本文件判定保持不变。", title)
+
+
+def run_print_wizard(review_dir: Path) -> int:
+    """Flow B: strip signature pages + duplex blank pads + extract sig pages."""
+    from locate_signature_pages import DEFAULT_PATTERNS, load_patterns, locate
+    from prepare_print_packet import prepare_print_packet
+    from pypdf import PdfReader
+
+    title = f"双面打印包 · {UI_BUILD}"
+    print_dir = review_dir / "print"
+    print_dir.mkdir(parents=True, exist_ok=True)
+
+    contract = choose_pdf("步骤 1：选择合同 PDF（将去掉签字页并生成打印正文）")
+    contract_pages = len(PdfReader(str(contract)).pages)
+    _log(f"步骤 1 完成：{contract.name}（{contract_pages} 页）", "ok")
+
+    result = locate(contract, [], load_patterns(DEFAULT_PATTERNS))
+    candidates = result["candidates"]
+    _log(f"步骤 2 完成：{len(candidates)} 个候选", "ok")
+
+    manual_label = "手动输入页码…"
+    range_text = ""
+    if candidates:
+        options = [
+            f"{chr(ord('A') + i)}. 第 {c['start']}–{c['end']} 页｜{c['page_count']} 页｜"
+            f"置信度 {c['confidence']}"
+            for i, c in enumerate(candidates)
+        ] + [manual_label]
+        picked = choose_from_list(
+            options,
+            "步骤 2：选择要从正文去掉的签字页区间",
+            title,
+        )
+        if picked != manual_label:
+            c = candidates[options.index(picked)]
+            range_text = (
+                str(c["start"]) if c["start"] == c["end"] else f"{c['start']}-{c['end']}"
+            )
+
+    while True:
+        if not range_text:
+            range_text = ask_text(
+                f"步骤 3：填写要去掉的合同签字页页码（1–{contract_pages}）。\n"
+                "例如 12 或 12-13。",
+                range_text or "",
+                title,
+            )
+        try:
+            start, end = parse_range_text(range_text)
+        except ValueError as exc:
+            alert(f"页码无效：{exc}", title)
+            range_text = ""
+            continue
+        if end > contract_pages:
+            alert(f"页码超出范围：合同只有 {contract_pages} 页。", title)
+            range_text = ""
+            continue
+
+        review_html = build_print_packet_review_page(
+            review_dir=print_dir,
+            contract=contract,
+            contract_pages=contract_pages,
+            start=start,
+            end=end,
+            locate_note=str(result.get("note") or ""),
+        )
+        subprocess.run(["open", str(review_html)], check=False)
+        _log(f"步骤 3：核对页已在浏览器打开（去掉第 {start}–{end} 页）", "ok")
+
+        choice = ask_buttons(
+            "步骤 3 核对：浏览器已打开双面打印包核对页（含缩略图与隔页示意）。\n\n"
+            f"将去掉：第 {start}–{end} 页（共 {end - start + 1} 页）\n\n"
+            "确认无误后生成打印正文 + 待签署签字页 + 作业说明。",
+            ["改页码", "取消", "确认并生成"],
+            "确认并生成",
+            title,
+        )
+        if choice == "确认并生成":
+            break
+        if choice == "取消":
+            _log("用户在步骤 3 取消", "info")
+            return 1
+        range_text = ""
+
+    out_dir = contract.parent
+    try:
+        report = prepare_print_packet(
+            contract,
+            [(start, end)],
+            output_dir=out_dir,
+        )
+    except SystemExit as exc:
+        alert(f"生成失败：{exc}", title)
+        return 1
+    except Exception as exc:
+        alert(f"生成失败：{type(exc).__name__}: {exc}", title)
+        return 1
+
+    outs = report["outputs"]
+    _log(f"步骤 4 完成：正文 {report['body_page_count']} 页，隔页 {report['blank_pad_count']}", "ok")
+    summary = (
+        f"已生成打印包\n\n"
+        f"正文：{Path(outs['body']).name}\n"
+        f"签字页：{Path(outs['signature_pages']).name}\n"
+        f"说明：{Path(outs['job_md']).name}\n\n"
+        f"原 {report['old_page_count']} 页 → 正文 {report['body_page_count']} 页"
+        f"（隔页 {report['blank_pad_count']}）"
+        f" + 签字页 {report['signature_page_count']} 页"
+    )
+    action = ask_buttons(
+        summary,
+        ["在 Finder 中显示", "完成", "打开作业说明"],
+        "打开作业说明",
+        title,
+    )
+    if action == "打开作业说明":
+        subprocess.run(["open", str(outs["job_md"])], check=False)
+    elif action == "在 Finder 中显示":
+        subprocess.run(["open", "-R", str(outs["body"])], check=False)
+    return 0
 
 
 def run_wizard(review_dir: Path) -> int:
@@ -628,8 +936,27 @@ def main() -> int:
     print(f"[replace-signature-pages] {UI_BUILD}", flush=True)
     print(f"[replace-signature-pages] loaded from: {Path(__file__).resolve()}", flush=True)
 
+    title = f"签字页作业台 · {UI_BUILD}"
+    try:
+        mode = ask_buttons(
+            "请选择流程：\n\n"
+            "嵌回电子版：把已签签字页嵌回合同 PDF。\n"
+            "双面打印包：去掉签字页生成打印正文，并在双面碰撞处插入空白隔页。",
+            ["取消", "双面打印包", "嵌回电子版"],
+            "嵌回电子版",
+            title,
+        )
+    except UserCancelled:
+        _log("已取消", "info")
+        return 1
+
+    if mode == "取消":
+        return 1
+
     review_dir = Path(tempfile.mkdtemp(prefix="sigpage-review-"))
     try:
+        if mode == "双面打印包":
+            return run_print_wizard(review_dir)
         return run_wizard(review_dir)
     except UserCancelled:
         _log("已取消", "info")

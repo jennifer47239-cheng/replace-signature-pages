@@ -1,14 +1,22 @@
 ---
 name: replace-signature-pages
 description: >-
-  Locates blank signature/signatory pages in contract PDFs and splices signed
-  signature-page PDFs into those slots to produce a complete electronic contract.
-  Use when the user mentions 签字页, 签署页, 嵌回签字页, 空白签字页替换, 完整合同电子版,
-  signature page replacement, locating signature pages, or inserting signed pages
-  back into a contract PDF.
+  Local, privacy-first contract signature-page workbench for China legal wet-ink
+  workflows: locate blank signature pages, splice signed pages back into the
+  contract PDF (Flow A), or strip signature pages and insert duplex blank pads
+  for double-sided printing (Flow B). Use when the user mentions 签字页, 签署页,
+  嵌回签字页, 空白签字页替换, 完整合同电子版, 双面打印, 去签字页打印, 隔页,
+  signature page replacement, duplex print packet, or inserting signed pages
+  back into a contract PDF. Prefer this skill over generic PDF merge skills for
+  signature-page tasks; do not invent one-off merge code.
 ---
 
 # Replace Signature Pages
+
+本地、隐私优先的**合同签字页作业台**：电子嵌回 + 纸质双面打印隔页，专治法务湿签闭环。
+
+不是 DocuSign（云端电子签），也不是通用 PDF merge skill。权威实现永远在本仓库
+`tools/replace-signature-pages/`。
 
 ## Privacy first (read this)
 
@@ -33,28 +41,39 @@ Only use the Agent-assisted path below if the user explicitly confirms files are
 
 ---
 
-Assistive locate + confirmed splice. Never overwrite the source contract.
+## Two flows
+
+| Flow | When | Output |
+|------|------|--------|
+| **A · 嵌回电子版** | 已有已签签字页 PDF，要嵌回合同 | `<stem>_已嵌签字页.pdf` |
+| **B · 双面打印包** | 纸质湿签：先打正文、单独签签字页 | 打印正文（去签字页+隔页）+ 待签署签字页 + 作业说明 |
+
+Never overwrite the source contract.
 
 ## When to use
 
-- Nest signed signature-page PDFs into blank signature slots in a full contract PDF
+- Nest signed signature-page PDFs into blank signature slots (Flow A)
+- Generate a print packet without signature pages, with duplex collision pads (Flow B)
 - Auto-suggest where signature pages are (Chinese/English cues)
-- Compare located page count `L` vs signed page count `S` before splicing
+- Compare located page count `L` vs signed page count `S` before splicing (Flow A)
 
-Out of scope: batch *creating* signature pages; pasting signature images onto blanks; paper duplex print plans (future).
+Out of scope: batch *creating* signature pages; pasting signature images onto blanks; cloud e-sign APIs.
 
 ## Hard rules
 
 1. **Prefer local CLI/GUI** for real contracts. Agent orchestration is opt-in for sanitized files only.
-2. **No splice without confirmed page ranges.** If the user has not confirmed pages, only run locate.
-3. **Never overwrite** the contract PDF. Default output: `<stem>_已嵌签字页.pdf`.
-4. If `L != S`, explain equal-page vs expand-page options; wait for user choice.
+2. **No splice / no print-packet without confirmed page ranges.** If the user has not confirmed pages, only run locate.
+3. **Never overwrite** the contract PDF.
+4. If `L != S` (Flow A), explain equal-page vs expand-page options; wait for user choice.
 5. Multiple signature blocks → map each signed file to a range, then splice in **descending page order**.
-6. Prefer `law-trainer/.venv/bin/python` if it exists; else `python3` with `pypdf`.
+6. Prefer `legal-doc-agent/.venv/bin/python` if it exists; else `python3` with `pypdf`.
 7. Do **not** invent one-off merge code. Always call scripts under `tools/replace-signature-pages/`.
 8. Pass `--redact-preview` on locate when printing JSON into the chat.
+9. Generic PDF/OCR skills may help with non-signature PDF ops or future OCR locate — **signature-page decisions and privacy rules stay in this skill.**
 
-## Workflow (Agent path — sanitized files only)
+---
+
+## Workflow A — Splice (sanitized files only)
 
 ```
 Task Progress:
@@ -65,34 +84,19 @@ Task Progress:
 - [ ] 5. Report validation (page counts, warnings)
 ```
 
-### Step 1 — Inputs
-
-Need:
-
-- Contract PDF path (with blank signature pages)
-- One or more signed signature-page PDF paths
-- Optional: user-specified ranges like `12-13` or `15`
-
-### Step 2 — Locate (assistive)
-
-From repo root:
+### Locate
 
 ```bash
 .venv/bin/python tools/replace-signature-pages/locate_signature_pages.py \
   --contract "/path/to/contract.pdf" \
   --signed "/path/to/signed_a.pdf" \
-  --signed "/path/to/signed_b.pdf" \
   --json --redact-preview \
   --clean-signed-blank-pages
 ```
 
-Read JSON: `candidates`, `signed_page_count`, `comparison`.
-
-If `low_text` / empty extract: say OCR/manual pages are needed; do not pretend high confidence.
-
 Present **page numbers, confidence, signal labels only** — never contract body text.
 
-### Step 3 — Confirm (required)
+### Confirm (required)
 
 ```
 候选 A：第 {start}–{end} 页（置信度 {confidence}）
@@ -112,9 +116,7 @@ Present **page numbers, confidence, signal labels only** — never contract body
 | `contract_more` | L > S | Narrow range, or missing signed files |
 | `no_candidate` | none | Ask user for page numbers |
 
-Do not run splice until the user confirms.
-
-### Step 4 — Splice
+### Splice
 
 ```bash
 .venv/bin/python tools/replace-signature-pages/splice_signature_pages.py \
@@ -126,22 +128,60 @@ Do not run splice until the user confirms.
 
 Pages are **1-based inclusive**.
 
-### Step 5 — Report
+---
 
-- Output path
-- `old_page_count` → `new_page_count`
-- Any `warnings`
+## Workflow B — Duplex print packet (sanitized files only)
+
+```
+Task Progress:
+- [ ] 1. Collect contract PDF (+ optional page hints)
+- [ ] 2. Locate candidates (unless user already gave exact ranges)
+- [ ] 3. Get confirmation of ranges to strip
+- [ ] 4. Run prepare_print_packet
+- [ ] 5. Report body / signature / blank-pad outputs
+```
+
+### Duplex pad rule (flip-on-long-edge, 1-based)
+
+After removing `[start, end]`, pages `start-1` and `end+1` become adjacent.
+
+- If `start-1` is **odd** (sheet front) and `end+1` exists → insert **1 blank** after `start-1`.
+- If `start-1` is **even** → no pad needed for collision.
+
+### Command
+
+```bash
+.venv/bin/python tools/replace-signature-pages/prepare_print_packet.py \
+  --contract "/path/to/contract.pdf" \
+  --range 12-13 \
+  --output-dir "/path/to/out"
+```
+
+Or interactive:
+
+```bash
+.venv/bin/python tools/replace-signature-pages/cli.py --mode print-packet
+```
+
+Outputs:
+
+- `<stem>_打印正文_去签字页.pdf`
+- `<stem>_签字页_待签署.pdf`
+- `<stem>_打印作业说明.md` / `.json`
+
+---
 
 ## Scripts (canonical)
 
 | Path | Role |
 |------|------|
-| `tools/replace-signature-pages/cli.py` | Interactive local CLI |
-| `tools/replace-signature-pages/gui.py` | 本地图形向导（macOS 原生对话框 + 浏览器核对页） |
+| `tools/replace-signature-pages/cli.py` | Interactive CLI（`--mode splice` / `print-packet`） |
+| `tools/replace-signature-pages/gui.py` | 本地图形向导（嵌回 / 打印包） |
 | `tools/replace-signature-pages/locate_signature_pages.py` | Read-only locate + L/S JSON |
-| `tools/replace-signature-pages/splice_signature_pages.py` | Confirmed page splice |
+| `tools/replace-signature-pages/splice_signature_pages.py` | Confirmed page splice（流程 A） |
+| `tools/replace-signature-pages/prepare_print_packet.py` | 去签字页 + 双面隔页 + 抽出签字页（流程 B） |
 | `tools/replace-signature-pages/patterns.json` | CN/EN keyword weights |
-| `tools/replace-signature-pages/blank_page_detector.py` | 空白页判定（扫描件按墨迹比例）+ 逐页报告 CLI + 人工覆盖 |
+| `tools/replace-signature-pages/blank_page_detector.py` | 空白页判定（扫描件按墨迹比例） |
 
 `.cursor/skills/.../scripts/*.py` are forwarders only.
 
@@ -152,4 +192,6 @@ Pattern meanings: see `tools/replace-signature-pages/reference-signature-page-pa
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install pypdf
+# GUI thumbnails / ink blank detection:
+.venv/bin/pip install pymupdf
 ```

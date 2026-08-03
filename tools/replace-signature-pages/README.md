@@ -1,8 +1,15 @@
 # 嵌回签字页 · 本机工具
 
-把已签签字页 PDF 嵌回合同中的空白签字页位置。**全程本机、无网络、不调用 AI**，适合处理未脱敏合同。
+本地、隐私优先的**合同签字页作业台**（相对 DocuSign / 通用 PDF 工具的差异化）：
 
-当前版本：**0.3.0**（扫描件空白页按墨迹判定、原生向导、两处人工核对，详见 [CHANGELOG.md](./CHANGELOG.md)）
+| 流程 | 场景 | 产物 |
+|------|------|------|
+| **A · 嵌回电子版** | 已签签字页 PDF → 嵌回合同 | `<stem>_已嵌签字页.pdf` |
+| **B · 双面打印包** | 纸质湿签：打正文、单独签、再物理插页 | 去签字页正文 + 双面隔页 + 待签署签字页 + 作业说明 |
+
+**全程本机、无网络、不调用 AI**，适合处理未脱敏合同。
+
+当前版本：**0.4.0**（流程 B 双面打印包；详见 [CHANGELOG.md](./CHANGELOG.md)）
 
 ## 依赖
 
@@ -25,16 +32,22 @@ python3 -m venv .venv
 ### 交互式 CLI（推荐）
 
 ```bash
-# 仓库根目录
+# 仓库根目录 — 交互选择流程 A / B
 .venv/bin/python tools/replace-signature-pages/cli.py
 
-# 或带参数
-.venv/bin/python tools/replace-signature-pages/cli.py \
+# 流程 A：嵌回电子版
+.venv/bin/python tools/replace-signature-pages/cli.py --mode splice \
   --contract "/path/合同.pdf" \
   --signed "/path/已签.pdf"
+
+# 流程 B：双面打印包
+.venv/bin/python tools/replace-signature-pages/cli.py --mode print-packet \
+  --contract "/path/合同.pdf"
 ```
 
-流程：选文件 → 打印候选页码（默认**不**显示正文预览）→ 输入确认 → 嵌回。
+流程 A：选文件 → 打印候选页码（默认**不**显示正文预览）→ 输入确认 → 嵌回。
+
+流程 B：选合同 → 定位候选 → 确认去掉的签字页 → 生成打印正文（必要时插空白隔页）+ 待签署签字页 + 作业说明。
 
 未脱敏合同时不要加 `--show-preview`。
 
@@ -44,7 +57,11 @@ python3 -m venv .venv
 .venv/bin/python tools/replace-signature-pages/gui.py
 ```
 
-依次弹出五步：①选合同 PDF → ②选已签签字页（可多选）+ 空白页判定核对 → ③从定位候选中选择页码 → ④浏览器打开核对页 → ⑤选保存位置并生成。
+启动后先选流程：**嵌回电子版** 或 **双面打印包**。
+
+双面打印包流程：①选合同 → ②选候选页码 → ③**浏览器打开缩略图核对页**（红框＝去掉的签字页，灰框＝前后页，紫虚线＝空白隔页 + 双面打印顺序示意）→ 确认后生成打印正文 / 待签署签字页 / 作业说明。
+
+嵌回流程依次：①选合同 PDF → ②选已签签字页（可多选）+ 空白页判定核对 → ③从定位候选中选择页码 → ④浏览器打开核对页 → ⑤选保存位置并生成。
 
 步骤 2 选择「自动跳过空白页」后，会先在浏览器打开**空白页判定核对页**：每一页都有缩略图、墨迹比例与文字字数，蓝框＝保留插入，虚线灰框＝判定为空白不插入。判定不对就在对话框选「手动调整」，按文件填写要当作空白的页码（如 `3,5` 或 `2-3`，留空表示全部插入）；改完会重新出图，确认后才进入下一步。**手动结果优先于自动判定**，后续步骤不会再重新检测。
 
@@ -86,7 +103,15 @@ python3 -m venv .venv
   --replace 12-13:/path/已签.pdf \
   --output "/path/合同_已嵌签字页.pdf" \
   --clean-signed-blank-pages
+
+# 流程 B：去签字页 + 双面隔页
+.venv/bin/python tools/replace-signature-pages/prepare_print_packet.py \
+  --contract "/path/合同.pdf" \
+  --range 12-13 \
+  --output-dir "/path/out"
 ```
+
+**双面隔页规则（长边翻转、1-based）**：去掉签字区 `[start,end]` 后，若前一页 `start-1` 为奇数正面且后面还有正文，则在接合处插入 1 页空白，避免「签字页前一页」与「后一页」打到同一张纸正反面。
 
 ## 安全说明
 
@@ -96,8 +121,10 @@ python3 -m venv .venv
 | Cursor Agent / 聊天上传 | **不要**用于未脱敏合同 |
 | `--show-preview` | 会在终端显示页内文字，涉密时关闭 |
 
-永不覆盖原合同；默认输出：`<原名>_已嵌签字页.pdf`。
+永不覆盖原合同；流程 A 默认输出：`<原名>_已嵌签字页.pdf`。
 
-## 与 Cursor Skill 的关系
+## 与 Cursor Skill / 通用 PDF skill 的关系
 
 权威实现在本目录。`.cursor/skills/replace-signature-pages` 仅作说明/转发；处理未脱敏合同时请直接跑本工具，不要让 Agent 编排。
+
+通用 PDF/OCR skill（merge/split/OCR）可作为底层能力由 Agent 编排，但**签字页定位、确认、嵌回、双面隔页与隐私边界**仍归本工具；不要用通用 merge 临场替代本目录脚本。
