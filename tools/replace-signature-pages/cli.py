@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Interactive CLI: Flow A (splice) or Flow B (duplex print packet). Local only, no AI."""
+"""Interactive CLI: Flow A / B / C (extract). Local only, no AI."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ TOOL_DIR = Path(__file__).resolve().parent
 if str(TOOL_DIR) not in sys.path:
     sys.path.insert(0, str(TOOL_DIR))
 
+from extract_signature_pages import extract_signature_pages
 from locate_signature_pages import DEFAULT_PATTERNS, load_patterns, locate
 from prepare_print_packet import prepare_print_packet
 from splice_signature_pages import default_output_path, parse_range, splice
@@ -24,11 +25,14 @@ CONFIRM_RE = re.compile(
 
 MODE_SPLICE = "splice"
 MODE_PRINT = "print-packet"
+MODE_EXTRACT = "extract"
 
 
 def _banner(mode: str) -> None:
     if mode == MODE_PRINT:
         title = "双面打印包 · 去签字页 + 隔页（CLI）"
+    elif mode == MODE_EXTRACT:
+        title = "提取签字页 · 仅抽页（CLI · 流程 C）"
     else:
         title = "嵌回签字页 · 本机工具（CLI）"
     print(
@@ -157,9 +161,13 @@ def _collect_replacements(
     return replacements
 
 
-def _collect_ranges(*, allow_multiple: bool = True) -> list[tuple[int, int]] | None:
+def _collect_ranges(
+    *,
+    allow_multiple: bool = True,
+    purpose: str = "去掉",
+) -> list[tuple[int, int]] | None:
     print(
-        "\n请确认要去掉的签字页页码（打印包将从正文中移除这些页）：\n"
+        f"\n请确认要{purpose}的签字页页码：\n"
         "  · 回复「确认 12-13」或「12-13」\n"
         "  · 多段：确认第一段后可继续添加；直接回车结束\n"
         "  · 回复「q」退出"
@@ -389,30 +397,111 @@ def run_print_packet(
     return 0 if report.get("ok", True) else 2
 
 
+def run_extract(
+    contract: Path | None,
+    *,
+    output_dir: Path | None,
+    show_preview: bool,
+    patterns_path: Path,
+    ranges: list[tuple[int, int]] | None = None,
+    ocr: bool = False,
+    per_range: bool = False,
+) -> int:
+    _banner(MODE_EXTRACT)
+
+    if contract is None:
+        contract = _prompt_path("合同 PDF 路径")
+    elif not contract.is_file():
+        print(f"合同不存在: {contract}", file=sys.stderr)
+        return 1
+
+    if not patterns_path.is_file():
+        print(f"patterns.json 不存在: {patterns_path}", file=sys.stderr)
+        return 1
+
+    if ranges is None:
+        if not ocr:
+            ocr_raw = input(
+                "扫描件/低文字页是否启用本机 OCR？(默认 n，输入 y 开启): "
+            ).strip().lower()
+            ocr = ocr_raw in {"y", "yes", "是"}
+        _show_locate(
+            contract,
+            [],
+            show_preview=show_preview,
+            patterns_path=patterns_path,
+            clean_blank=False,
+            ocr=ocr,
+        )
+        ranges = _collect_ranges(purpose="抽取")
+        if not ranges:
+            print("已取消。")
+            return 1
+        if not per_range:
+            pr = input(
+                "是否按段各生成一份签字页 PDF？(默认 n，输入 y 开启): "
+            ).strip().lower()
+            per_range = pr in {"y", "yes", "是"}
+
+    out_dir = output_dir or contract.parent
+    print(f"\n输出目录: {out_dir}")
+    final = input("最后确认，输入 y 提取签字页，其他键取消: ").strip().lower()
+    if final not in {"y", "yes", "是"}:
+        print("已取消。")
+        return 1
+
+    try:
+        report = extract_signature_pages(
+            contract,
+            ranges,
+            output_dir=out_dir,
+            per_range=per_range,
+        )
+    except SystemExit as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    print("\n完成。")
+    outs = report["outputs"]
+    print(f"  签字页: {outs['signature_pages']}")
+    print(f"  提取说明: {outs['report_md']}")
+    print(
+        f"  页数: 原 {report['old_page_count']} → 抽出 "
+        f"{report['signature_page_count']} 页"
+        f"（区间 {', '.join(report['confirmed_ranges'])}）"
+    )
+    for part in report.get("per_range_outputs") or []:
+        print(f"  分段: {part['range']} → {part['path']}")
+    return 0 if report.get("ok", True) else 2
+
+
 def _choose_mode_interactive() -> str:
     print(
         "请选择模式：\n"
         "  1) 嵌回电子版（流程 A：已签页嵌回合同）\n"
         "  2) 双面打印包（流程 B：去签字页 + 隔页）\n"
+        "  3) 提取签字页（流程 C：仅抽页，不改正文）\n"
     )
     while True:
-        raw = input("输入 1 或 2（默认 1）: ").strip() or "1"
+        raw = input("输入 1 / 2 / 3（默认 1）: ").strip() or "1"
         if raw in {"1", "a", "A", "splice"}:
             return MODE_SPLICE
         if raw in {"2", "b", "B", "print", "print-packet"}:
             return MODE_PRINT
-        print("  请输入 1 或 2")
+        if raw in {"3", "c", "C", "extract"}:
+            return MODE_EXTRACT
+        print("  请输入 1、2 或 3")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="本机签字页工具：嵌回电子版或生成双面打印包（不经过 AI）",
+        description="本机签字页工具：嵌回 / 双面打印包 / 提取签字页（不经过 AI）",
     )
     parser.add_argument(
         "--mode",
-        choices=[MODE_SPLICE, MODE_PRINT],
+        choices=[MODE_SPLICE, MODE_PRINT, MODE_EXTRACT],
         default=None,
-        help="splice=嵌回电子版；print-packet=双面打印包（省略则交互选择）",
+        help="splice / print-packet / extract（省略则交互选择）",
     )
     parser.add_argument("--contract", type=Path, help="合同 PDF（省略则交互输入）")
     parser.add_argument(
@@ -427,13 +516,18 @@ def main() -> int:
         action="append",
         default=[],
         dest="ranges",
-        help="确认的签字页范围（流程 B 非交互时可重复传入）",
+        help="确认的签字页范围（流程 B/C 非交互时可重复传入）",
     )
     parser.add_argument("--output", type=Path, help="流程 A 输出路径")
     parser.add_argument(
         "--output-dir",
         type=Path,
-        help="流程 B 输出目录（默认与合同同目录）",
+        help="流程 B/C 输出目录（默认与合同同目录）",
+    )
+    parser.add_argument(
+        "--per-range",
+        action="store_true",
+        help="流程 C：按段各写一份签字页 PDF",
     )
     parser.add_argument(
         "--show-preview",
@@ -492,14 +586,15 @@ def main() -> int:
 
     mode = args.mode or _choose_mode_interactive()
 
+    ranges: list[tuple[int, int]] | None = None
+    if args.ranges:
+        try:
+            ranges = [parse_range(spec) for spec in args.ranges]
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+
     if mode == MODE_PRINT:
-        ranges: list[tuple[int, int]] | None = None
-        if args.ranges:
-            try:
-                ranges = [parse_range(spec) for spec in args.ranges]
-            except ValueError as exc:
-                print(str(exc), file=sys.stderr)
-                return 1
         return run_print_packet(
             args.contract,
             output_dir=args.output_dir,
@@ -507,6 +602,17 @@ def main() -> int:
             patterns_path=args.patterns,
             ranges=ranges,
             ocr=args.ocr,
+        )
+
+    if mode == MODE_EXTRACT:
+        return run_extract(
+            args.contract,
+            output_dir=args.output_dir,
+            show_preview=args.show_preview,
+            patterns_path=args.patterns,
+            ranges=ranges,
+            ocr=args.ocr,
+            per_range=args.per_range,
         )
 
     return run_splice(

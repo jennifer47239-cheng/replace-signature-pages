@@ -63,12 +63,15 @@ def score_page(
     weights = patterns["weights"]
     signals: list[str] = []
     score = 0.0
-    low_text = len(re.sub(r"\s+", "", text)) < 15
+    compact_len = len(re.sub(r"\s+", "", text))
+    low_text = compact_len < 15
 
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     head = "\n".join(lines[:5])
     foot = "\n".join(lines[-5:]) if lines else ""
     full = text
+    has_strong = False
+    has_medium = False
 
     def hit(term: str, where: str) -> bool:
         if not term.isascii():
@@ -80,6 +83,7 @@ def score_page(
     for lang in ("zh", "en"):
         for term in patterns["strong"].get(lang, []):
             if hit(term, full):
+                has_strong = True
                 score += weights["strong"]
                 loc = "footer" if hit(term, foot) else ("title" if hit(term, head) else "body")
                 signals.append(f"strong:{term}@{loc}")
@@ -90,25 +94,39 @@ def score_page(
 
         for term in patterns["medium"].get(lang, []):
             if hit(term, full):
+                has_medium = True
                 score += weights["medium"]
                 signals.append(f"medium:{term}")
 
-        alone = True
+        weak_w = float(weights.get("weak", 0.35))
+        for term in patterns.get("weak", {}).get(lang, []):
+            if hit(term, full):
+                score += weak_w
+                signals.append(f"weak:{term}")
+
         for term in patterns["exclude_if_alone"].get(lang, []):
             if hit(term, full):
                 # Penalty only when no strong hits yet
-                if not any(s.startswith("strong:") for s in signals):
+                if not has_strong:
                     score += weights["exclude_penalty"]
                     signals.append(f"exclude:{term}")
-                alone = False
                 break
-        _ = alone
 
     br = blank_ratio(text)
     if br > 0.35:
         bonus = weights["blank_ratio_bonus_max"] * br
         score += bonus
         signals.append(f"layout:blank_ratio={br:.2f}")
+
+    # Dense body pages that only mention parties (甲方/乙方) are rarely sig pages
+    if (
+        not has_strong
+        and not has_medium
+        and compact_len >= 200
+        and float(weights.get("dense_body_penalty", 0))
+    ):
+        score += float(weights["dense_body_penalty"])
+        signals.append("layout:dense_body")
 
     if total_pages > 1:
         late = page_index / (total_pages - 1)
@@ -128,6 +146,18 @@ def score_page(
     return score, uniq, low_text
 
 
+def _signals_look_like_signature(signals: list[str]) -> bool:
+    """True if signals suggest a real signature block, not just 甲方/乙方 mentions."""
+    if any(s.startswith("strong:") for s in signals):
+        return True
+    if any(s.startswith("medium:") for s in signals):
+        return True
+    if any(s.startswith("layout:blank_ratio=") for s in signals):
+        # Nearly blank pages in a high-score merge block
+        return True
+    return False
+
+
 def merge_candidates(
     page_scores: list[dict[str, Any]],
     min_score: float,
@@ -139,9 +169,18 @@ def merge_candidates(
         if page_scores[i]["score"] < min_score:
             i += 1
             continue
+        # Do not start a block on party-only / density noise without sig cues
+        if not _signals_look_like_signature(page_scores[i]["signals"]):
+            i += 1
+            continue
         start = i
         end = i
         while end + 1 < n and page_scores[end + 1]["score"] >= min_score:
+            nxt = page_scores[end + 1]
+            # Stop merging when the next high page is only weak party labels
+            # (avoids swallowing long body spans between real sig blocks).
+            if not _signals_look_like_signature(nxt["signals"]):
+                break
             end += 1
         block = page_scores[start : end + 1]
         conf_raw = sum(p["score"] for p in block) / len(block)

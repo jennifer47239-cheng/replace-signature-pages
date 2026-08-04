@@ -6,10 +6,11 @@
 |------|------|------|
 | **A · 嵌回电子版** | 已签签字页 PDF → 嵌回合同 | `<stem>_已嵌签字页.pdf` |
 | **B · 双面打印包** | 纸质湿签：打正文、单独签、再物理插页 | 去签字页正文 + 双面隔页 + 待签署签字页 + 作业说明 |
+| **C · 提取签字页** | 只要签字页 PDF（不改正文、无隔页） | `<stem>_签字页.pdf` + 提取说明 |
 
 **全程本机、无网络、不调用 AI**，适合处理未脱敏合同。
 
-当前版本：**0.5.0**（多选候选 + OCR 定位 + 批量 + 启动列表菜单；详见 [CHANGELOG.md](./CHANGELOG.md)）
+当前版本：**0.6.0**（流程 C 提取 + 候选与手填并存 + 定位收紧；详见 [CHANGELOG.md](./CHANGELOG.md)）
 
 ## 依赖
 
@@ -43,11 +44,19 @@ python3 -m venv .venv
 # 流程 B：双面打印包
 .venv/bin/python tools/replace-signature-pages/cli.py --mode print-packet \
   --contract "/path/合同.pdf"
+
+# 流程 C：仅提取签字页
+.venv/bin/python tools/replace-signature-pages/cli.py --mode extract \
+  --contract "/path/合同.pdf" \
+  --range 8-9 --range 20-21 \
+  --output-dir "/path/out"
 ```
 
 流程 A：选文件 → 打印候选页码（默认**不**显示正文预览）→ 输入确认 → 嵌回。
 
 流程 B：选合同 → 定位候选 → 确认去掉的签字页 → 生成打印正文（必要时插空白隔页）+ 待签署签字页 + 作业说明。
+
+流程 C：选合同 → 定位候选 → 确认要抽取的页 → 写出签字页 PDF（可选 `--per-range` 按段拆分）+ 提取说明。**不修改合同、不加隔页。**
 
 未脱敏合同时不要加 `--show-preview`。
 
@@ -57,7 +66,7 @@ python3 -m venv .venv
 .venv/bin/python tools/replace-signature-pages/gui.py
 ```
 
-启动后可选：**嵌回电子版** / **双面打印包** / **批量打印包**。
+启动后可选：**嵌回电子版** / **双面打印包** / **仅提取签字页** / **批量打印包**。
 
 - 候选列表支持 **Command 多选**；也可手填 `8-9,20-21`
 - 定位前可开 **本机 OCR**（扫描件低文字页）
@@ -110,6 +119,10 @@ python3 -m venv .venv
 .venv/bin/python tools/replace-signature-pages/cli.py --mode print-packet \
   --contract "/path/合同.pdf" --range 8-9 --range 20-21
 
+# 流程 C：仅提取签字页（合并 PDF；可选 --per-range 按段拆分）
+.venv/bin/python tools/replace-signature-pages/extract_signature_pages.py \
+  --contract "/path/合同.pdf" --range 8-9 --range 20-21 --output-dir "/path/out"
+
 # 扫描件 OCR 辅助定位
 .venv/bin/python tools/replace-signature-pages/locate_signature_pages.py \
   --contract "/path/扫描合同.pdf" --json --redact-preview --ocr
@@ -131,10 +144,10 @@ python3 -m venv .venv
 | Cursor Agent / 聊天上传 | **不要**用于未脱敏合同 |
 | `--show-preview` | 会在终端显示页内文字，涉密时关闭 |
 
-永不覆盖原合同；流程 A 默认输出：`<原名>_已嵌签字页.pdf`。
+永不覆盖原合同；流程 A 默认输出：`<原名>_已嵌签字页.pdf`；流程 C：`<原名>_签字页.pdf`。
 
 ## 与 Cursor Skill / 通用 PDF skill 的关系
 
 权威实现在本目录。`.cursor/skills/replace-signature-pages` 仅作说明/转发；处理未脱敏合同时请直接跑本工具，不要让 Agent 编排。
 
-通用 PDF/OCR skill（merge/split/OCR）可作为底层能力由 Agent 编排，但**签字页定位、确认、嵌回、双面隔页与隐私边界**仍归本工具；不要用通用 merge 临场替代本目录脚本。
+通用 PDF/OCR skill（merge/split/OCR）可作为底层能力由 Agent 编排，但**签字页定位、确认、嵌回、提取、双面隔页与隐私边界**仍归本工具；不要用通用 merge 临场替代本目录脚本。

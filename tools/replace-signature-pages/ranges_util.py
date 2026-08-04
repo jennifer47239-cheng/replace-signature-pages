@@ -29,3 +29,18 @@ def format_range(start: int, end: int) -> str:
 
 def format_ranges(ranges: list[tuple[int, int]]) -> str:
     return ", ".join(format_range(s, e) for s, e in ranges)
+
+
+def coalesce_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Merge overlapping or adjacent ranges; returns sorted list."""
+    if not ranges:
+        return []
+    spans = sorted((int(s), int(e)) for s, e in ranges)
+    out: list[tuple[int, int]] = [spans[0]]
+    for start, end in spans[1:]:
+        prev_s, prev_e = out[-1]
+        if start <= prev_e + 1:
+            out[-1] = (prev_s, max(prev_e, end))
+        else:
+            out.append((start, end))
+    return out

@@ -15,6 +15,37 @@ Skill 说明：`.cursor/skills/replace-signature-pages/SKILL.md`
 
 - 非 macOS OCR 后端
 - 流程 A 多段各自缩略图核对页（当前以第一段为例 + 列表确认）
+- Party / Signatory 标签 + 分组 ZIP（本机手填/规则，无 LLM）
+- 继续提升签字页定位精确度（更多版式样本）
+
+---
+
+## [0.6.0] - 2026-08-04
+
+流程 C 仅提取签字页；多选候选可与手填并存；定位规则收紧。全程本机、不调用 LLM。
+
+### Added
+
+- **流程 C · 提取签字页**：`extract_signature_pages.py`
+  - 按确认页码拷贝 → `<stem>_签字页.pdf` + 提取说明（md/json）
+  - 可选 `--per-range`：按段各写一份 `stem_签字页_8-9.pdf`
+  - 不改正文、不插双面隔页（相对流程 B）
+- CLI `--mode extract`
+- GUI「仅提取签字页」：多选候选 + 缩略图核对
+- Agent scenario `signature_extract` / tool `extract_signature_pages`
+- `ranges_util.coalesce_ranges`：合并重叠/相邻区间
+- Skill / README 同步三流程说明
+
+### Changed
+
+- GUI 启动列表增加流程 C；`UI_BUILD`：`ui-20260804-pick-mix`
+- 手动补充项文案改为「额外手动补充页码…（可与上方候选同时勾选）」
+- 定位：`甲方/乙方/丙方` 降为 **weak**；密文正文惩罚；合并候选时不以「仅相对方称呼」起块/续块
+- 增补中文 strong/medium 信号词（本页为签署页、签字/盖章 等）
+
+### Fixed
+
+- GUI 选页：勾选「手动补充」时**保留**已选 A/B/C 候选，与手填页码合并（先前互斥导致大合同多段签字难选）
 
 ---
 
@@ -191,4 +222,5 @@ Skill 说明：`.cursor/skills/replace-signature-pages/SKILL.md`
 | 0.4.0 | 2026-08-03 | 流程 B 双面打印包（去签字页 + 隔页） |
 | 0.4.1 | 2026-08-03 | 流程 B GUI 缩略图核对页 |
 | 0.5.0 | 2026-08-03 | 多选/OCR/批量；修 macOS 启动菜单三按钮限制 |
-| Unreleased | — | 非 macOS OCR 等 |
+| 0.6.0 | 2026-08-04 | 流程 C 提取；候选+手填并存；定位收紧 |
+| Unreleased | — | 非 macOS OCR；分组 ZIP 等 |

@@ -21,7 +21,7 @@ if str(TOOL_DIR) not in sys.path:
     sys.path.insert(0, str(TOOL_DIR))
 
 # If dialogs lack this stamp in their title, you are not running this file.
-UI_BUILD = "ui-20260803-multi-ocr-batch"
+UI_BUILD = "ui-20260804-pick-mix"
 
 
 class UserCancelled(Exception):
@@ -552,6 +552,115 @@ def build_print_packet_review_page(
     return review_html
 
 
+def build_extract_review_page(
+    *,
+    review_dir: Path,
+    contract: Path,
+    contract_pages: int,
+    ranges: list[tuple[int, int]],
+    locate_note: str = "",
+    per_range: bool = False,
+) -> Path:
+    """Write extract-review.html: pages that will be copied into the signature PDF."""
+    for stale in review_dir.glob("*.png"):
+        stale.unlink(missing_ok=True)
+
+    from ranges_util import format_ranges
+
+    ranges = sorted(ranges)
+    pages_to_render: set[int] = set()
+    for s, e in ranges:
+        pages_to_render.update(range(s, e + 1))
+        if s - 1 >= 1:
+            pages_to_render.add(s - 1)
+        if e + 1 <= contract_pages:
+            pages_to_render.add(e + 1)
+
+    try:
+        contract_pngs = _render_page_pngs(
+            contract, sorted(pages_to_render), review_dir, "e",
+        )
+        render_ok = True
+    except Exception as exc:  # noqa: BLE001
+        _log(f"缩略图渲染失败（需 pymupdf）：{exc}", "err")
+        contract_pngs = {}
+        render_ok = False
+
+    block_sections: list[str] = []
+    extracted_count = 0
+    for idx, (s, e) in enumerate(ranges, start=1):
+        before, after = s - 1, e + 1
+        extracted_count += e - s + 1
+        cards: list[str] = []
+        if before >= 1:
+            cards.append(
+                _card(
+                    contract_pngs.get(before),
+                    f"第 {before} 页",
+                    "相邻 · 不抽出",
+                    "context",
+                ),
+            )
+        for page_no in range(s, e + 1):
+            cards.append(
+                _card(
+                    contract_pngs.get(page_no),
+                    f"第 {page_no} 页",
+                    "抽出 → 签字页包",
+                    "replace",
+                ),
+            )
+        if after <= contract_pages:
+            cards.append(
+                _card(
+                    contract_pngs.get(after),
+                    f"第 {after} 页",
+                    "相邻 · 不抽出",
+                    "context",
+                ),
+            )
+        block_sections.append(
+            f'<div class="panel"><h2>区间 {idx}：第 {s}–{e} 页</h2>'
+            f'<div class="grid">{"".join(cards)}</div></div>'
+        )
+
+    verdict_class = "ok"
+    verdict = f"将抽出 {len(ranges)} 段共 {extracted_count} 页（原合同不修改）"
+    if per_range:
+        verdict += "｜并按段各写一份 PDF"
+    if not render_ok:
+        verdict_class = "warn"
+        verdict += "｜缩略图未生成：请 pip install pymupdf 后重试"
+
+    rows = [
+        ("合同文件", contract.name),
+        ("合同总页数", f"{contract_pages} 页"),
+        ("抽出的签字页", format_ranges(ranges)),
+        ("签字页总页数", f"{extracted_count} 页"),
+        ("按段拆分", "是" if per_range else "否"),
+    ]
+    rows_html = "".join(
+        f"<tr><th>{html.escape(k)}</th><td>{html.escape(v)}</td></tr>" for k, v in rows
+    )
+    body = (
+        f'<div class="panel"><table>{rows_html}</table></div>'
+        + "".join(block_sections)
+    )
+
+    review_html = review_dir / "extract-review.html"
+    review_html.write_text(
+        _html_document(
+            "流程 C · 核对提取签字页",
+            verdict_class,
+            verdict,
+            body,
+            locate_note or "确认无误后回到对话框点「确认并生成」。",
+        ),
+        encoding="utf-8",
+    )
+    return review_html
+
+
 # --- Wizard ----------------------------------------------------------------
 
 
@@ -645,13 +754,19 @@ def pick_candidate_ranges(
     contract_pages: int,
     title: str,
     *,
-    prompt: str = "选择签字页区间（可多选；Command 多选）",
+    prompt: str = "选择签字页区间（可多选；可同时勾选手动补充）",
 ) -> list[tuple[int, int]]:
-    """Multi-select candidates or manual multi-range entry."""
-    from ranges_util import format_range
+    """Multi-select auto candidates; optional manual ranges combine with selection.
 
-    manual_label = "手动输入多段页码…"
-    ranges: list[tuple[int, int]] | None = None
+    Manual entry is an *additional* list option — selecting it does not discard
+    already-chosen A/B/C candidates.
+    """
+    from ranges_util import coalesce_ranges, format_ranges
+
+    manual_label = "额外手动补充页码…（可与上方候选同时勾选）"
+    selected: list[tuple[int, int]] = []
+    want_manual = not candidates  # no auto candidates → must type pages
+
     if candidates:
         options = [
             f"{chr(ord('A') + i)}. 第 {c['start']}–{c['end']} 页｜"
@@ -659,31 +774,53 @@ def pick_candidate_ranges(
             for i, c in enumerate(candidates)
         ] + [manual_label]
         picked_list = choose_from_list_multi(options, prompt, title)
-        if manual_label not in picked_list:
-            ranges = []
-            for picked in picked_list:
-                idx = options.index(picked)
+        for picked in picked_list:
+            if picked == manual_label:
+                want_manual = True
+                continue
+            idx = options.index(picked)
+            if 0 <= idx < len(candidates):
                 c = candidates[idx]
-                ranges.append((int(c["start"]), int(c["end"])))
-            ranges = sorted(ranges)
+                selected.append((int(c["start"]), int(c["end"])))
 
     while True:
-        if ranges is None:
+        manual: list[tuple[int, int]] = []
+        if want_manual:
+            preset = format_ranges(selected) if selected else ""
+            hint = (
+                f"已选自动候选：{format_ranges(selected)}\n"
+                "请填写还需补充的页码（与候选合并）。\n"
+                if selected
+                else "请填写签字页页码。\n"
+            )
             raw = ask_text(
-                f"填写页码（1–{contract_pages}）。多段用逗号分隔，例如 8-9,20-21。",
-                "",
+                f"{hint}"
+                f"范围 1–{contract_pages}；多段用逗号，例如 8-9,20-21。\n"
+                "（只补缺的段即可；已勾选候选会自动保留）",
+                "" if selected else preset,
                 title,
             )
-            try:
-                ranges = parse_ranges_text(raw)
-            except ValueError as exc:
-                alert(f"页码无效：{exc}", title)
-                ranges = None
+            if raw.strip():
+                try:
+                    manual = parse_ranges_text(raw)
+                except ValueError as exc:
+                    alert(f"页码无效：{exc}", title)
+                    continue
+            elif not selected:
+                alert("请填写页码，或取消后重选。", title)
                 continue
+
+        ranges = coalesce_ranges(selected + manual)
+        if not ranges:
+            alert("尚未选择任何签字页区间。", title)
+            # Force another pick cycle if possible
+            want_manual = True
+            continue
+
         bad = [f"{s}-{e}" for s, e in ranges if e > contract_pages or s < 1]
         if bad:
             alert(f"页码超出范围：{', '.join(bad)}（合同 {contract_pages} 页）", title)
-            ranges = None
+            want_manual = True
             continue
         return ranges
 
@@ -851,6 +988,186 @@ def run_print_wizard(
             subprocess.run(["open", str(outs["job_md"])], check=False)
         elif action == "在 Finder 中显示" and outs.get("body"):
             subprocess.run(["open", "-R", str(outs["body"])], check=False)
+    return 0 if ok_n else 1
+
+
+def run_extract_wizard(
+    review_dir: Path,
+    *,
+    contracts: list[Path] | None = None,
+    output_dir: Path | None = None,
+) -> int:
+    """Flow C: extract confirmed signature pages only (no body strip, no pads)."""
+    from extract_signature_pages import extract_signature_pages
+    from locate_signature_pages import DEFAULT_PATTERNS, load_patterns, locate
+    from pypdf import PdfReader
+    from ranges_util import format_ranges
+
+    title = f"提取签字页 · {UI_BUILD}"
+    extract_dir = review_dir / "extract"
+    extract_dir.mkdir(parents=True, exist_ok=True)
+
+    if contracts is None:
+        contracts = [choose_pdf("步骤 1：选择合同 PDF（将按确认页码抽取签字页）")]
+    if not contracts:
+        alert("未选择合同。", title)
+        return 1
+
+    batch_report: list[dict] = []
+    out_root = output_dir
+    if out_root is None and len(contracts) > 1:
+        out_root = choose_folder("选择批量输出文件夹")
+    elif out_root is None:
+        out_root = contracts[0].parent
+
+    per_range = (
+        ask_buttons(
+            "是否按段各生成一份签字页 PDF？\n"
+            "（例如 8-9 与 20-21 各一份；另仍会写一份合并 PDF）",
+            ["仅合并一份", "合并 + 按段拆分"],
+            "仅合并一份",
+            title,
+        )
+        == "合并 + 按段拆分"
+    )
+
+    patterns = load_patterns(DEFAULT_PATTERNS)
+
+    for ci, contract in enumerate(contracts, start=1):
+        contract_pages = len(PdfReader(str(contract)).pages)
+        _log(f"[{ci}/{len(contracts)}] {contract.name}（{contract_pages} 页）", "ok")
+
+        probe = locate(contract, [], patterns, ocr=False)
+        use_ocr = ask_use_ocr(
+            title, low_text_pages=int(probe.get("low_text_page_count") or 0)
+        )
+        result = locate(contract, [], patterns, ocr=True) if use_ocr else probe
+        candidates = result["candidates"]
+        _log(
+            f"定位完成：{len(candidates)} 个候选"
+            f"{'（OCR）' if use_ocr else ''}",
+            "ok",
+        )
+
+        try:
+            ranges = pick_candidate_ranges(
+                candidates,
+                contract_pages,
+                title,
+                prompt=f"【{contract.name}】选择要抽取的签字页（可多选）",
+            )
+        except UserCancelled:
+            batch_report.append(
+                {"contract": str(contract), "status": "skipped", "reason": "cancelled"}
+            )
+            continue
+
+        while True:
+            review_html = build_extract_review_page(
+                review_dir=extract_dir,
+                contract=contract,
+                contract_pages=contract_pages,
+                ranges=ranges,
+                locate_note=str(result.get("note") or ""),
+                per_range=per_range,
+            )
+            subprocess.run(["open", str(review_html)], check=False)
+            choice = ask_buttons(
+                f"核对：{contract.name}\n抽取：{format_ranges(ranges)}\n\n"
+                "浏览器已打开缩略图核对页。",
+                ["改页码", "跳过此文件", "确认并生成"],
+                "确认并生成",
+                title,
+            )
+            if choice == "确认并生成":
+                break
+            if choice == "跳过此文件":
+                batch_report.append(
+                    {
+                        "contract": str(contract),
+                        "status": "skipped",
+                        "reason": "user_skip",
+                    }
+                )
+                ranges = []
+                break
+            ranges = pick_candidate_ranges(
+                candidates,
+                contract_pages,
+                title,
+                prompt="重新选择或手填多段页码",
+            )
+
+        if not ranges:
+            continue
+
+        dest = out_root if len(contracts) == 1 else (out_root / contract.stem)
+        try:
+            report = extract_signature_pages(
+                contract, ranges, output_dir=dest, per_range=per_range
+            )
+        except SystemExit as exc:
+            alert(f"{contract.name} 提取失败：{exc}", title)
+            batch_report.append(
+                {"contract": str(contract), "status": "error", "error": str(exc)}
+            )
+            continue
+        except Exception as exc:
+            alert(f"{contract.name} 提取失败：{type(exc).__name__}: {exc}", title)
+            batch_report.append(
+                {
+                    "contract": str(contract),
+                    "status": "error",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+            continue
+
+        batch_report.append(
+            {
+                "contract": str(contract),
+                "status": "ok",
+                "ranges": format_ranges(ranges),
+                "outputs": report.get("outputs"),
+                "signature_page_count": report.get("signature_page_count"),
+                "per_range_outputs": report.get("per_range_outputs"),
+            }
+        )
+        _log(
+            f"完成 {contract.name}：抽出 {report['signature_page_count']} 页",
+            "ok",
+        )
+
+    ok_n = sum(1 for r in batch_report if r.get("status") == "ok")
+    if len(contracts) > 1:
+        report_path = out_root / "batch_extract_report.json"
+        report_path.write_text(
+            json.dumps(batch_report, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        ask_buttons(
+            f"批量提取完成：成功 {ok_n}/{len(contracts)}\n报告：{report_path.name}",
+            ["好"],
+            "好",
+            title,
+        )
+        subprocess.run(["open", "-R", str(report_path)], check=False)
+    elif ok_n:
+        outs = batch_report[0].get("outputs") or {}
+        action = ask_buttons(
+            f"已提取签字页\n"
+            f"PDF：{Path(outs.get('signature_pages', '')).name}\n"
+            f"页数：{batch_report[0].get('signature_page_count')}",
+            ["在 Finder 中显示", "完成", "打开说明"],
+            "打开说明",
+            title,
+        )
+        if action == "打开说明" and outs.get("report_md"):
+            subprocess.run(["open", str(outs["report_md"])], check=False)
+        elif action == "在 Finder 中显示" and outs.get("signature_pages"):
+            subprocess.run(
+                ["open", "-R", str(outs["signature_pages"])], check=False
+            )
     return 0 if ok_n else 1
 
 
@@ -1071,11 +1388,12 @@ def main() -> int:
 
     title = f"签字页作业台 · {UI_BUILD}"
     try:
-        # display dialog allows at most 3 buttons; use a list for 4 modes.
+        # display dialog allows at most 3 buttons; list supports 4+ modes.
         mode = choose_from_list(
             [
                 "嵌回电子版（已签页嵌回，可多选候选）",
                 "双面打印包（去签字页 + 隔页，可多选候选）",
+                "仅提取签字页（流程 C，可多选候选）",
                 "批量打印包（多选多份合同，逐份确认）",
             ],
             "请选择流程：",
@@ -1090,6 +1408,8 @@ def main() -> int:
         if mode.startswith("批量打印包"):
             contracts = choose_pdfs("批量：选择多份合同 PDF")
             return run_print_wizard(review_dir, contracts=contracts)
+        if mode.startswith("仅提取签字页"):
+            return run_extract_wizard(review_dir)
         if mode.startswith("双面打印包"):
             return run_print_wizard(review_dir)
         return run_wizard(review_dir)
