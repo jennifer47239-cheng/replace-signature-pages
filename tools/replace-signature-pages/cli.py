@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sys
 from pathlib import Path
@@ -194,6 +195,7 @@ def _show_locate(
     show_preview: bool,
     patterns_path: Path,
     clean_blank: bool,
+    ocr: bool = False,
 ) -> dict:
     print("\n正在定位签字页候选（只读）…")
     patterns = load_patterns(patterns_path)
@@ -202,6 +204,7 @@ def _show_locate(
         signed,
         patterns,
         clean_signed_blank_pages=clean_blank,
+        ocr=ocr,
     )
     if not show_preview:
         for c in result["candidates"]:
@@ -256,12 +259,18 @@ def run_splice(
     ).strip().lower()
     clean_blank = raw in {"", "y", "yes", "是"} if raw != "n" else False
 
+    ocr_raw = input(
+        "扫描件/低文字页是否启用本机 OCR 辅助定位？(默认 n，输入 y 开启): "
+    ).strip().lower()
+    use_ocr = ocr_raw in {"y", "yes", "是"}
+
     _show_locate(
         contract,
         signed,
         show_preview=show_preview,
         patterns_path=patterns_path,
         clean_blank=clean_blank,
+        ocr=use_ocr,
     )
 
     replacements = _collect_replacements(signed)
@@ -319,6 +328,7 @@ def run_print_packet(
     show_preview: bool,
     patterns_path: Path,
     ranges: list[tuple[int, int]] | None = None,
+    ocr: bool = False,
 ) -> int:
     _banner(MODE_PRINT)
 
@@ -333,12 +343,18 @@ def run_print_packet(
         return 1
 
     if ranges is None:
+        if not ocr:
+            ocr_raw = input(
+                "扫描件/低文字页是否启用本机 OCR？(默认 n，输入 y 开启): "
+            ).strip().lower()
+            ocr = ocr_raw in {"y", "yes", "是"}
         _show_locate(
             contract,
             [],
             show_preview=show_preview,
             patterns_path=patterns_path,
             clean_blank=False,
+            ocr=ocr,
         )
         ranges = _collect_ranges()
         if not ranges:
@@ -430,7 +446,49 @@ def main() -> int:
         default=DEFAULT_PATTERNS,
         help="patterns.json 路径",
     )
+    parser.add_argument(
+        "--ocr",
+        action="store_true",
+        help="定位时对低文字页启用本机 OCR（macOS Vision）",
+    )
+    parser.add_argument(
+        "--batch-dir",
+        type=Path,
+        help="批量：合同 PDF 所在文件夹（流程 B；需 --output-dir）",
+    )
+    parser.add_argument(
+        "--ranges-file",
+        type=Path,
+        help="批量：JSON 文件名→页码列表（有则非交互）",
+    )
     args = parser.parse_args()
+
+    if args.batch_dir:
+        from batch_cli import _load_ranges_file, run_batch_print
+
+        if not args.output_dir:
+            print("批量模式需要 --output-dir", file=sys.stderr)
+            return 1
+        contracts = sorted(args.batch_dir.glob("*.pdf"))
+        if not contracts:
+            print(f"目录无 PDF: {args.batch_dir}", file=sys.stderr)
+            return 1
+        ranges_map = None
+        if args.ranges_file:
+            try:
+                ranges_map = _load_ranges_file(args.ranges_file)
+            except Exception as exc:  # noqa: BLE001
+                print(f"ranges-file 无效: {exc}", file=sys.stderr)
+                return 1
+        summary = run_batch_print(
+            contracts,
+            args.output_dir,
+            ocr=args.ocr,
+            ranges_map=ranges_map,
+            interactive=args.ranges_file is None,
+        )
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+        return 0 if summary.get("ok", 0) else 2
 
     mode = args.mode or _choose_mode_interactive()
 
@@ -448,6 +506,7 @@ def main() -> int:
             show_preview=args.show_preview,
             patterns_path=args.patterns,
             ranges=ranges,
+            ocr=args.ocr,
         )
 
     return run_splice(

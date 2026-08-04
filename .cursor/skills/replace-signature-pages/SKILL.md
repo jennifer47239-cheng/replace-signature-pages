@@ -2,13 +2,14 @@
 name: replace-signature-pages
 description: >-
   Local, privacy-first contract signature-page workbench for China legal wet-ink
-  workflows: locate blank signature pages, splice signed pages back into the
-  contract PDF (Flow A), or strip signature pages and insert duplex blank pads
-  for double-sided printing (Flow B). Use when the user mentions 签字页, 签署页,
-  嵌回签字页, 空白签字页替换, 完整合同电子版, 双面打印, 去签字页打印, 隔页,
-  signature page replacement, duplex print packet, or inserting signed pages
-  back into a contract PDF. Prefer this skill over generic PDF merge skills for
-  signature-page tasks; do not invent one-off merge code.
+  workflows: locate blank signature pages (optional on-device OCR for scans),
+  multi-select candidates, splice signed pages (Flow A), strip signature pages
+  with duplex blank pads (Flow B), or batch print packets. Use when the user
+  mentions 签字页, 签署页, 嵌回签字页, 空白签字页替换, 完整合同电子版, 双面打印,
+  去签字页打印, 隔页, 批量, OCR定位, 扫描件签字页, signature page replacement,
+  duplex print packet, or inserting signed pages back into a contract PDF.
+  Prefer this skill over generic PDF merge skills for signature-page tasks;
+  do not invent one-off merge code.
 ---
 
 # Replace Signature Pages
@@ -180,6 +181,8 @@ Outputs:
 | `tools/replace-signature-pages/locate_signature_pages.py` | Read-only locate + L/S JSON |
 | `tools/replace-signature-pages/splice_signature_pages.py` | Confirmed page splice（流程 A） |
 | `tools/replace-signature-pages/prepare_print_packet.py` | 去签字页 + 双面隔页 + 抽出签字页（流程 B） |
+| `tools/replace-signature-pages/batch_cli.py` | 批量流程 B（交互确认或 ranges-file） |
+| `tools/replace-signature-pages/page_ocr.py` | 本机 macOS Vision OCR（低文字页） |
 | `tools/replace-signature-pages/patterns.json` | CN/EN keyword weights |
 | `tools/replace-signature-pages/blank_page_detector.py` | 空白页判定（扫描件按墨迹比例） |
 

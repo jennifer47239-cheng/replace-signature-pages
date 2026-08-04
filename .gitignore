@@ -5,3 +5,4 @@ __pycache__/
 *.pdf
 *.tmp
 ._*
+tools/replace-signature-pages/.macos_vision_ocr

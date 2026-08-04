@@ -215,6 +215,7 @@ def locate(
     clean_signed_blank_pages: bool = False,
     signed_blank_nonspace_threshold: int = 15,
     signed_blank_content_bytes_max: int = 800,
+    ocr: bool = False,
 ) -> dict[str, Any]:
     reader = PdfReader(str(contract))
     total = len(reader.pages)
@@ -234,10 +235,46 @@ def locate(
                 "signals": signals,
                 "preview": lines[:4],
                 "low_text": low_text,
+                "text": text,
             }
         )
 
-    # Use merge floor for adjacency; filter display by candidate_min on avg handled in merge
+    ocr_pages: list[int] = []
+    ocr_note = ""
+    if ocr:
+        low_pages = [p["page"] for p in page_scores if p["low_text"]]
+        if low_pages:
+            try:
+                from page_ocr import ocr_pdf_pages, vision_ocr_available
+
+                if not vision_ocr_available():
+                    ocr_note = "OCR requested but macOS Vision helper unavailable"
+                else:
+                    ocr_map = ocr_pdf_pages(contract, low_pages)
+                    ocr_pages = sorted(ocr_map.keys())
+                    for p in page_scores:
+                        ocr_text = ocr_map.get(p["page"], "")
+                        if not ocr_text.strip():
+                            continue
+                        # Prefer OCR text for scoring when native extract was weak
+                        merged = (p["text"] + "\n" + ocr_text).strip()
+                        score, signals, low_text = score_page(
+                            merged, p["page"] - 1, total, patterns
+                        )
+                        lines = [ln.strip() for ln in merged.splitlines() if ln.strip()]
+                        p["score"] = score
+                        p["signals"] = signals + ["source:ocr"]
+                        p["preview"] = lines[:4]
+                        p["low_text"] = low_text
+                        p["text"] = merged
+                    ocr_note = f"OCR applied to {len(ocr_pages)} low-text page(s)"
+            except Exception as exc:  # noqa: BLE001
+                ocr_note = f"OCR failed: {exc}"
+
+    # Drop raw text before returning (privacy / payload size)
+    for p in page_scores:
+        p.pop("text", None)
+
     candidates = merge_candidates(page_scores, merge_floor)
     candidates = [c for c in candidates if c["avg_score"] >= min_score]
 
@@ -261,6 +298,9 @@ def locate(
     removed_blank_total = sum(
         int(d.get("blank_page_count", 0)) for d in signed_cleaning_details
     )
+    note = "Assistive only. Confirm page ranges with the user before splicing."
+    if ocr_note:
+        note = f"{note} {ocr_note}."
     return {
         "contract": str(contract),
         "total_pages": total,
@@ -271,9 +311,9 @@ def locate(
         "candidates": candidates,
         "comparison": comparison,
         "low_text_page_count": len(low_text_pages),
-        "note": (
-            "Assistive only. Confirm page ranges with the user before splicing."
-        ),
+        "ocr_enabled": bool(ocr),
+        "ocr_pages": ocr_pages,
+        "note": note,
     }
 
 
@@ -318,6 +358,11 @@ def main() -> int:
         action="store_true",
         help="Omit page text previews from output (safer for unredacted contracts)",
     )
+    parser.add_argument(
+        "--ocr",
+        action="store_true",
+        help="OCR low-text/scanned pages via on-device macOS Vision before scoring",
+    )
     args = parser.parse_args()
 
     if not args.contract.is_file():
@@ -339,6 +384,7 @@ def main() -> int:
         clean_signed_blank_pages=args.clean_signed_blank_pages,
         signed_blank_nonspace_threshold=args.signed_blank_nonspace_threshold,
         signed_blank_content_bytes_max=args.signed_blank_content_bytes_max,
+        ocr=args.ocr,
     )
     if args.redact_preview:
         for c in result.get("candidates", []):

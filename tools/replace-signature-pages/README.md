@@ -9,7 +9,7 @@
 
 **全程本机、无网络、不调用 AI**，适合处理未脱敏合同。
 
-当前版本：**0.4.1**（流程 B 双面打印包 + GUI 缩略图核对；详见 [CHANGELOG.md](./CHANGELOG.md)）
+当前版本：**0.5.0**（多选候选 + OCR 定位 + 批量；详见 [CHANGELOG.md](./CHANGELOG.md)）
 
 ## 依赖
 
@@ -57,9 +57,11 @@ python3 -m venv .venv
 .venv/bin/python tools/replace-signature-pages/gui.py
 ```
 
-启动后先选流程：**嵌回电子版** 或 **双面打印包**。
+启动后可选：**嵌回电子版** / **双面打印包** / **批量打印包**。
 
-双面打印包流程：①选合同 → ②选候选页码 → ③**浏览器打开缩略图核对页**（红框＝去掉的签字页，灰框＝前后页，紫虚线＝空白隔页 + 双面打印顺序示意）→ 确认后生成打印正文 / 待签署签字页 / 作业说明。
+- 候选列表支持 **Command 多选**；也可手填 `8-9,20-21`
+- 定位前可开 **本机 OCR**（扫描件低文字页）
+- 批量：多选多份合同，逐份确认，输出目录含 `batch_report.json`
 
 嵌回流程依次：①选合同 PDF → ②选已签签字页（可多选）+ 空白页判定核对 → ③从定位候选中选择页码 → ④浏览器打开核对页 → ⑤选保存位置并生成。
 
@@ -104,11 +106,19 @@ python3 -m venv .venv
   --output "/path/合同_已嵌签字页.pdf" \
   --clean-signed-blank-pages
 
-# 流程 B：去签字页 + 双面隔页
-.venv/bin/python tools/replace-signature-pages/prepare_print_packet.py \
-  --contract "/path/合同.pdf" \
-  --range 12-13 \
-  --output-dir "/path/out"
+# 流程 B：双面打印包
+.venv/bin/python tools/replace-signature-pages/cli.py --mode print-packet \
+  --contract "/path/合同.pdf" --range 8-9 --range 20-21
+
+# 扫描件 OCR 辅助定位
+.venv/bin/python tools/replace-signature-pages/locate_signature_pages.py \
+  --contract "/path/扫描合同.pdf" --json --redact-preview --ocr
+
+# 批量打印包（交互确认每份；或 --ranges-file 非交互）
+.venv/bin/python tools/replace-signature-pages/batch_cli.py \
+  --batch-dir "/path/contracts" \
+  --output-dir "/path/out" \
+  --ocr
 ```
 
 **双面隔页规则（长边翻转、1-based）**：去掉签字区 `[start,end]` 后，若前一页 `start-1` 为奇数正面且后面还有正文，则在接合处插入 1 页空白，避免「签字页前一页」与「后一页」打到同一张纸正反面。

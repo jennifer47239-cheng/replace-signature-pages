@@ -9,6 +9,7 @@ browser. Page thumbnails stay in a temp dir that is deleted when the tool exits.
 from __future__ import annotations
 
 import html
+import json
 import shutil
 import subprocess
 import sys
@@ -20,7 +21,7 @@ if str(TOOL_DIR) not in sys.path:
     sys.path.insert(0, str(TOOL_DIR))
 
 # If dialogs lack this stamp in their title, you are not running this file.
-UI_BUILD = "ui-20260803-print-review"
+UI_BUILD = "ui-20260803-multi-ocr-batch"
 
 
 class UserCancelled(Exception):
@@ -74,6 +75,11 @@ def choose_pdfs(prompt: str) -> list[Path]:
 
 
 def ask_buttons(text: str, buttons: list[str], default: str, title: str) -> str:
+    if len(buttons) > 3:
+        raise ValueError(
+            f"macOS display dialog allows at most 3 buttons, got {len(buttons)}; "
+            "use choose_from_list instead"
+        )
     button_list = ", ".join(_as_literal(b) for b in buttons)
     return _osascript(
         f"button returned of (display dialog {_as_literal(text)} "
@@ -99,6 +105,31 @@ def choose_from_list(items: list[str], prompt: str, title: str) -> str:
         "return item 1 of chosen",
     )
     return out
+
+
+def choose_from_list_multi(items: list[str], prompt: str, title: str) -> list[str]:
+    """Return one or more selected list items (AppleScript multi-select)."""
+    item_list = ", ".join(_as_literal(i) for i in items)
+    out = _osascript(
+        f"set chosen to choose from list {{{item_list}}} "
+        f"with prompt {_as_literal(prompt)} with title {_as_literal(title)} "
+        f"default items {{{_as_literal(items[0])}}} "
+        "with multiple selections allowed",
+        "if chosen is false then error number -128",
+        'set acc to ""',
+        "repeat with i in chosen",
+        "set acc to acc & i & linefeed",
+        "end repeat",
+        "return acc",
+    )
+    return [line for line in out.splitlines() if line.strip()]
+
+
+def choose_folder(prompt: str) -> Path:
+    out = _osascript(
+        f"POSIX path of (choose folder with prompt {_as_literal(prompt)})",
+    )
+    return Path(out)
 
 
 def ask_save_path(default_name: str, default_dir: Path, prompt: str) -> Path:
@@ -391,28 +422,35 @@ def build_print_packet_review_page(
     review_dir: Path,
     contract: Path,
     contract_pages: int,
-    start: int,
-    end: int,
+    start: int | None = None,
+    end: int | None = None,
+    ranges: list[tuple[int, int]] | None = None,
     locate_note: str = "",
 ) -> Path:
-    """Write print-review.html: pages to strip, neighbors, and duplex blank pad."""
+    """Write print-review.html for one or more ranges to strip + duplex pads."""
     for stale in review_dir.glob("*.png"):
         stale.unlink(missing_ok=True)
 
     from prepare_print_packet import needs_duplex_pad
+    from ranges_util import format_ranges
 
-    target_pages = list(range(start, end + 1))
-    before = start - 1
-    after = end + 1
-    context_pages = [p for p in (before, after) if 1 <= p <= contract_pages]
-    will_pad = needs_duplex_pad(start) and after <= contract_pages
+    if ranges is None:
+        if start is None or end is None:
+            raise ValueError("start/end or ranges required")
+        ranges = [(start, end)]
+    ranges = sorted(ranges)
+
+    pages_to_render: set[int] = set()
+    for s, e in ranges:
+        pages_to_render.update(range(s, e + 1))
+        if s - 1 >= 1:
+            pages_to_render.add(s - 1)
+        if e + 1 <= contract_pages:
+            pages_to_render.add(e + 1)
 
     try:
         contract_pngs = _render_page_pngs(
-            contract,
-            sorted(set(target_pages + context_pages)),
-            review_dir,
-            "p",
+            contract, sorted(pages_to_render), review_dir, "p",
         )
         render_ok = True
     except Exception as exc:  # noqa: BLE001
@@ -420,99 +458,63 @@ def build_print_packet_review_page(
         contract_pngs = {}
         render_ok = False
 
-    contract_cards: list[str] = []
-    # Show in reading order: before → removed block → [pad marker] → after
-    if before >= 1:
-        contract_cards.append(
-            _card(
-                contract_pngs.get(before),
-                f"第 {before} 页",
-                "签字页前一页 · 保留在打印正文",
-                "context",
-            ),
-        )
-    for page_no in target_pages:
-        contract_cards.append(
-            _card(
-                contract_pngs.get(page_no),
-                f"第 {page_no} 页",
-                "将从正文去掉 · 抽到「待签署签字页」",
-                "replace",
-            ),
-        )
-    if will_pad:
-        contract_cards.append(
-            _card(
-                None,
-                "空白隔页",
-                f"插在原第 {before} 页之后，避免与第 {after} 页打到同一张纸正反面",
-                "pad",
-            ),
-        )
-    if after <= contract_pages:
-        contract_cards.append(
-            _card(
-                contract_pngs.get(after),
-                f"第 {after} 页",
-                "签字页后一页 · 保留在打印正文",
-                "context",
-            ),
+    block_sections: list[str] = []
+    pad_count = 0
+    removed_count = 0
+    for idx, (s, e) in enumerate(ranges, start=1):
+        before, after = s - 1, e + 1
+        will_pad = needs_duplex_pad(s) and after <= contract_pages
+        if will_pad:
+            pad_count += 1
+        removed_count += e - s + 1
+        cards: list[str] = []
+        if before >= 1:
+            cards.append(
+                _card(
+                    contract_pngs.get(before),
+                    f"第 {before} 页",
+                    "前一页 · 保留",
+                    "context",
+                ),
+            )
+        for page_no in range(s, e + 1):
+            cards.append(
+                _card(
+                    contract_pngs.get(page_no),
+                    f"第 {page_no} 页",
+                    "去掉 → 待签署",
+                    "replace",
+                ),
+            )
+        if will_pad:
+            cards.append(
+                _card(
+                    None,
+                    "空白隔页",
+                    f"插在原第 {before} 页后",
+                    "pad",
+                ),
+            )
+        if after <= contract_pages:
+            cards.append(
+                _card(
+                    contract_pngs.get(after),
+                    f"第 {after} 页",
+                    "后一页 · 保留",
+                    "context",
+                ),
+            )
+        pad_label = "将插 1 空白隔页" if will_pad else "无需隔页"
+        block_sections.append(
+            f'<div class="panel"><h2>区间 {idx}：第 {s}–{e} 页（{pad_label}）</h2>'
+            f'<div class="grid">{"".join(cards)}</div></div>'
         )
 
-    # Sequence chips: original junction vs print body
-    remove_label = (
-        f"第 {start} 页"
-        if start == end
-        else f"第 {start}–{end} 页"
+    verdict_class = "ok"
+    verdict = (
+        f"将去掉 {len(ranges)} 段共 {removed_count} 页签字页"
+        f"（隔页 {pad_count}）"
     )
-    orig_chips = []
-    if before >= 1:
-        orig_chips.append(f'<span class="chip keep">原第 {before} 页</span>')
-        orig_chips.append('<span class="arrow">→</span>')
-    orig_chips.append(f'<span class="chip remove">{html.escape(remove_label)}（去掉）</span>')
-    if after <= contract_pages:
-        orig_chips.append('<span class="arrow">→</span>')
-        orig_chips.append(f'<span class="chip keep">原第 {after} 页</span>')
-
-    body_chips = []
-    if before >= 1:
-        side = "正面" if before % 2 == 1 else "背面"
-        body_chips.append(f'<span class="chip keep">原第 {before} 页（{side}）</span>')
-        body_chips.append('<span class="arrow">→</span>')
-    if will_pad:
-        body_chips.append(
-            f'<span class="chip pad">空白隔页'
-            f'（{"背面" if before % 2 == 1 else "正面"}）</span>'
-        )
-        body_chips.append('<span class="arrow">→</span>')
-    if after <= contract_pages:
-        # After pad (or if no pad and before even), after starts new sheet front
-        if will_pad or before < 1 or before % 2 == 0:
-            after_side = "新张正面"
-        else:
-            after_side = "背面（有碰撞风险，本应已插隔页）"
-        body_chips.append(
-            f'<span class="chip keep">原第 {after} 页（{after_side}）</span>'
-        )
-
-    removed_count = end - start + 1
-    if will_pad:
-        verdict_class, verdict = (
-            "ok",
-            f"将去掉签字页 {removed_count} 页，并在原第 {before} 页后插入 1 页空白隔页",
-        )
-    elif before >= 1 and after <= contract_pages:
-        verdict_class, verdict = (
-            "ok",
-            f"将去掉签字页 {removed_count} 页；接合处无需隔页"
-            f"（原第 {before} 页已是偶数背面）",
-        )
-    else:
-        verdict_class, verdict = (
-            "ok",
-            f"将去掉签字页 {removed_count} 页（位于文件首/尾，无双面接合）",
-        )
-
     if not render_ok:
         verdict_class = "warn"
         verdict += "｜缩略图未生成：请 pip install pymupdf 后重试"
@@ -520,36 +522,21 @@ def build_print_packet_review_page(
     rows = [
         ("合同文件", contract.name),
         ("合同总页数", f"{contract_pages} 页"),
-        ("去掉的签字页", f"第 {start}–{end} 页（共 {removed_count} 页）"),
-        ("双面隔页", "是，插入 1 页" if will_pad else "否"),
+        ("去掉的签字页", format_ranges(ranges)),
+        ("双面隔页", f"{pad_count} 页"),
         (
             "打印正文页数",
-            f"{contract_pages - removed_count + (1 if will_pad else 0)} 页"
-            f"（原 {contract_pages} − {removed_count}"
-            f"{' + 1 隔页' if will_pad else ''}）",
+            f"{contract_pages - removed_count + pad_count} 页",
         ),
-        ("待签署签字页", f"{removed_count} 页（单独打印）"),
+        ("待签署签字页", f"{removed_count} 页"),
     ]
     rows_html = "".join(
         f"<tr><th>{html.escape(k)}</th><td>{html.escape(v)}</td></tr>" for k, v in rows
     )
-
-    body = f"""<div class="panel"><table>{rows_html}</table></div>
-<div class="panel">
-  <h2>接合处示意（原合同）</h2>
-  <p class="hint">红删除线为将去掉的签字页；绿为保留页。</p>
-  <div class="seq">{"".join(orig_chips)}</div>
-</div>
-<div class="panel">
-  <h2>双面打印正文顺序（生成后）</h2>
-  <p class="hint">紫虚线为空白隔页，用于把「前一页」与「后一页」拆到不同纸张。</p>
-  <div class="seq">{"".join(body_chips) if body_chips else '<span class="chip">（无后续正文接合）</span>'}</div>
-</div>
-<div class="panel">
-  <h2>页缩略图</h2>
-  <p class="hint">红框＝去掉并抽到待签署 PDF；灰框＝保留在打印正文；紫虚线＝将插入的空白隔页。</p>
-  <div class="grid">{"".join(contract_cards)}</div>
-</div>"""
+    body = (
+        f'<div class="panel"><table>{rows_html}</table></div>'
+        + "".join(block_sections)
+    )
 
     review_html = review_dir / "print-review.html"
     review_html.write_text(
@@ -569,9 +556,18 @@ def build_print_packet_review_page(
 
 
 def parse_range_text(text: str) -> tuple[int, int]:
-    from splice_signature_pages import parse_range
+    from ranges_util import parse_multi_ranges
 
-    return parse_range(text.replace(" ", "").replace("–", "-").replace("—", "-"))
+    ranges = parse_multi_ranges(text.replace("–", "-").replace("—", "-"))
+    if len(ranges) != 1:
+        raise ValueError("expected a single range; use parse_ranges_text for multiple")
+    return ranges[0]
+
+
+def parse_ranges_text(text: str) -> list[tuple[int, int]]:
+    from ranges_util import parse_multi_ranges
+
+    return parse_multi_ranges(text.replace("–", "-").replace("—", "-"))
 
 
 def review_blank_pages(
@@ -626,124 +622,236 @@ def review_blank_pages(
                 alert(f"{sp.name}：{exc}\n本文件判定保持不变。", title)
 
 
-def run_print_wizard(review_dir: Path) -> int:
-    """Flow B: strip signature pages + duplex blank pads + extract sig pages."""
+def ask_use_ocr(title: str, *, low_text_pages: int = 0) -> bool:
+    hint = (
+        f"\n（约 {low_text_pages} 页几乎无文字，建议开启）"
+        if low_text_pages
+        else ""
+    )
+    return (
+        ask_buttons(
+            f"是否对扫描件/低文字页启用本机 OCR 辅助定位？{hint}\n\n"
+            "仅在本机用 macOS Vision 识别，不上传。",
+            ["不使用 OCR", "启用 OCR"],
+            "不使用 OCR" if low_text_pages < 3 else "启用 OCR",
+            title,
+        )
+        == "启用 OCR"
+    )
+
+
+def pick_candidate_ranges(
+    candidates: list[dict],
+    contract_pages: int,
+    title: str,
+    *,
+    prompt: str = "选择签字页区间（可多选；Command 多选）",
+) -> list[tuple[int, int]]:
+    """Multi-select candidates or manual multi-range entry."""
+    from ranges_util import format_range
+
+    manual_label = "手动输入多段页码…"
+    ranges: list[tuple[int, int]] | None = None
+    if candidates:
+        options = [
+            f"{chr(ord('A') + i)}. 第 {c['start']}–{c['end']} 页｜"
+            f"{c['page_count']} 页｜置信度 {c['confidence']}"
+            for i, c in enumerate(candidates)
+        ] + [manual_label]
+        picked_list = choose_from_list_multi(options, prompt, title)
+        if manual_label not in picked_list:
+            ranges = []
+            for picked in picked_list:
+                idx = options.index(picked)
+                c = candidates[idx]
+                ranges.append((int(c["start"]), int(c["end"])))
+            ranges = sorted(ranges)
+
+    while True:
+        if ranges is None:
+            raw = ask_text(
+                f"填写页码（1–{contract_pages}）。多段用逗号分隔，例如 8-9,20-21。",
+                "",
+                title,
+            )
+            try:
+                ranges = parse_ranges_text(raw)
+            except ValueError as exc:
+                alert(f"页码无效：{exc}", title)
+                ranges = None
+                continue
+        bad = [f"{s}-{e}" for s, e in ranges if e > contract_pages or s < 1]
+        if bad:
+            alert(f"页码超出范围：{', '.join(bad)}（合同 {contract_pages} 页）", title)
+            ranges = None
+            continue
+        return ranges
+
+
+def run_print_wizard(
+    review_dir: Path,
+    *,
+    contracts: list[Path] | None = None,
+    output_dir: Path | None = None,
+) -> int:
+    """Flow B: one or more contracts; multi-range select + duplex pads."""
     from locate_signature_pages import DEFAULT_PATTERNS, load_patterns, locate
     from prepare_print_packet import prepare_print_packet
     from pypdf import PdfReader
+    from ranges_util import format_ranges
 
     title = f"双面打印包 · {UI_BUILD}"
     print_dir = review_dir / "print"
     print_dir.mkdir(parents=True, exist_ok=True)
 
-    contract = choose_pdf("步骤 1：选择合同 PDF（将去掉签字页并生成打印正文）")
-    contract_pages = len(PdfReader(str(contract)).pages)
-    _log(f"步骤 1 完成：{contract.name}（{contract_pages} 页）", "ok")
+    if contracts is None:
+        contracts = [choose_pdf("步骤 1：选择合同 PDF（将去掉签字页并生成打印正文）")]
+    if not contracts:
+        alert("未选择合同。", title)
+        return 1
 
-    result = locate(contract, [], load_patterns(DEFAULT_PATTERNS))
-    candidates = result["candidates"]
-    _log(f"步骤 2 完成：{len(candidates)} 个候选", "ok")
+    batch_report: list[dict] = []
+    out_root = output_dir
+    if out_root is None and len(contracts) > 1:
+        out_root = choose_folder("选择批量输出文件夹")
+    elif out_root is None:
+        out_root = contracts[0].parent
 
-    manual_label = "手动输入页码…"
-    range_text = ""
-    if candidates:
-        options = [
-            f"{chr(ord('A') + i)}. 第 {c['start']}–{c['end']} 页｜{c['page_count']} 页｜"
-            f"置信度 {c['confidence']}"
-            for i, c in enumerate(candidates)
-        ] + [manual_label]
-        picked = choose_from_list(
-            options,
-            "步骤 2：选择要从正文去掉的签字页区间",
-            title,
+    patterns = load_patterns(DEFAULT_PATTERNS)
+
+    for ci, contract in enumerate(contracts, start=1):
+        contract_pages = len(PdfReader(str(contract)).pages)
+        _log(f"[{ci}/{len(contracts)}] {contract.name}（{contract_pages} 页）", "ok")
+
+        # Quick pass without OCR to see low_text count
+        probe = locate(contract, [], patterns, ocr=False)
+        use_ocr = ask_use_ocr(
+            title, low_text_pages=int(probe.get("low_text_page_count") or 0)
         )
-        if picked != manual_label:
-            c = candidates[options.index(picked)]
-            range_text = (
-                str(c["start"]) if c["start"] == c["end"] else f"{c['start']}-{c['end']}"
-            )
+        result = (
+            locate(contract, [], patterns, ocr=True) if use_ocr else probe
+        )
+        candidates = result["candidates"]
+        _log(
+            f"定位完成：{len(candidates)} 个候选"
+            f"{'（OCR）' if use_ocr else ''}",
+            "ok",
+        )
 
-    while True:
-        if not range_text:
-            range_text = ask_text(
-                f"步骤 3：填写要去掉的合同签字页页码（1–{contract_pages}）。\n"
-                "例如 12 或 12-13。",
-                range_text or "",
+        try:
+            ranges = pick_candidate_ranges(
+                candidates,
+                contract_pages,
+                title,
+                prompt=f"【{contract.name}】选择要去掉的签字页（可多选）",
+            )
+        except UserCancelled:
+            batch_report.append(
+                {"contract": str(contract), "status": "skipped", "reason": "cancelled"}
+            )
+            continue
+
+        while True:
+            review_html = build_print_packet_review_page(
+                review_dir=print_dir,
+                contract=contract,
+                contract_pages=contract_pages,
+                ranges=ranges,
+                locate_note=str(result.get("note") or ""),
+            )
+            subprocess.run(["open", str(review_html)], check=False)
+            choice = ask_buttons(
+                f"核对：{contract.name}\n去掉：{format_ranges(ranges)}\n\n"
+                "浏览器已打开缩略图核对页。",
+                ["改页码", "跳过此文件", "确认并生成"],
+                "确认并生成",
                 title,
             )
+            if choice == "确认并生成":
+                break
+            if choice == "跳过此文件":
+                batch_report.append(
+                    {
+                        "contract": str(contract),
+                        "status": "skipped",
+                        "reason": "user_skip",
+                    }
+                )
+                ranges = []
+                break
+            ranges = pick_candidate_ranges(
+                candidates,
+                contract_pages,
+                title,
+                prompt="重新选择或手填多段页码",
+            )
+
+        if not ranges:
+            continue
+
+        dest = out_root if len(contracts) == 1 else (out_root / contract.stem)
         try:
-            start, end = parse_range_text(range_text)
-        except ValueError as exc:
-            alert(f"页码无效：{exc}", title)
-            range_text = ""
+            report = prepare_print_packet(contract, ranges, output_dir=dest)
+        except SystemExit as exc:
+            alert(f"{contract.name} 生成失败：{exc}", title)
+            batch_report.append(
+                {"contract": str(contract), "status": "error", "error": str(exc)}
+            )
             continue
-        if end > contract_pages:
-            alert(f"页码超出范围：合同只有 {contract_pages} 页。", title)
-            range_text = ""
+        except Exception as exc:
+            alert(f"{contract.name} 生成失败：{type(exc).__name__}: {exc}", title)
+            batch_report.append(
+                {
+                    "contract": str(contract),
+                    "status": "error",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
             continue
 
-        review_html = build_print_packet_review_page(
-            review_dir=print_dir,
-            contract=contract,
-            contract_pages=contract_pages,
-            start=start,
-            end=end,
-            locate_note=str(result.get("note") or ""),
+        batch_report.append(
+            {
+                "contract": str(contract),
+                "status": "ok",
+                "ranges": format_ranges(ranges),
+                "outputs": report.get("outputs"),
+                "blank_pad_count": report.get("blank_pad_count"),
+            }
         )
-        subprocess.run(["open", str(review_html)], check=False)
-        _log(f"步骤 3：核对页已在浏览器打开（去掉第 {start}–{end} 页）", "ok")
+        _log(
+            f"完成 {contract.name}：正文 {report['body_page_count']} 页，"
+            f"隔页 {report['blank_pad_count']}",
+            "ok",
+        )
 
-        choice = ask_buttons(
-            "步骤 3 核对：浏览器已打开双面打印包核对页（含缩略图与隔页示意）。\n\n"
-            f"将去掉：第 {start}–{end} 页（共 {end - start + 1} 页）\n\n"
-            "确认无误后生成打印正文 + 待签署签字页 + 作业说明。",
-            ["改页码", "取消", "确认并生成"],
-            "确认并生成",
+    ok_n = sum(1 for r in batch_report if r.get("status") == "ok")
+    if len(contracts) > 1:
+        report_path = out_root / "batch_report.json"
+        report_path.write_text(
+            json.dumps(batch_report, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        ask_buttons(
+            f"批量完成：成功 {ok_n}/{len(contracts)}\n报告：{report_path.name}",
+            ["好"],
+            "好",
             title,
         )
-        if choice == "确认并生成":
-            break
-        if choice == "取消":
-            _log("用户在步骤 3 取消", "info")
-            return 1
-        range_text = ""
-
-    out_dir = contract.parent
-    try:
-        report = prepare_print_packet(
-            contract,
-            [(start, end)],
-            output_dir=out_dir,
+        subprocess.run(["open", "-R", str(report_path)], check=False)
+    elif ok_n:
+        outs = batch_report[0].get("outputs") or {}
+        action = ask_buttons(
+            f"已生成打印包\n正文：{Path(outs.get('body', '')).name}\n"
+            f"签字页：{Path(outs.get('signature_pages', '')).name}",
+            ["在 Finder 中显示", "完成", "打开作业说明"],
+            "打开作业说明",
+            title,
         )
-    except SystemExit as exc:
-        alert(f"生成失败：{exc}", title)
-        return 1
-    except Exception as exc:
-        alert(f"生成失败：{type(exc).__name__}: {exc}", title)
-        return 1
-
-    outs = report["outputs"]
-    _log(f"步骤 4 完成：正文 {report['body_page_count']} 页，隔页 {report['blank_pad_count']}", "ok")
-    summary = (
-        f"已生成打印包\n\n"
-        f"正文：{Path(outs['body']).name}\n"
-        f"签字页：{Path(outs['signature_pages']).name}\n"
-        f"说明：{Path(outs['job_md']).name}\n\n"
-        f"原 {report['old_page_count']} 页 → 正文 {report['body_page_count']} 页"
-        f"（隔页 {report['blank_pad_count']}）"
-        f" + 签字页 {report['signature_page_count']} 页"
-    )
-    action = ask_buttons(
-        summary,
-        ["在 Finder 中显示", "完成", "打开作业说明"],
-        "打开作业说明",
-        title,
-    )
-    if action == "打开作业说明":
-        subprocess.run(["open", str(outs["job_md"])], check=False)
-    elif action == "在 Finder 中显示":
-        subprocess.run(["open", "-R", str(outs["body"])], check=False)
-    return 0
+        if action == "打开作业说明" and outs.get("job_md"):
+            subprocess.run(["open", str(outs["job_md"])], check=False)
+        elif action == "在 Finder 中显示" and outs.get("body"):
+            subprocess.run(["open", "-R", str(outs["body"])], check=False)
+    return 0 if ok_n else 1
 
 
 def run_wizard(review_dir: Path) -> int:
@@ -796,55 +904,66 @@ def run_wizard(review_dir: Path) -> int:
         "ok",
     )
 
-    # 3. Locate
-    result = locate(
+    # 3. Locate (+ optional OCR)
+    patterns = load_patterns(DEFAULT_PATTERNS)
+    probe = locate(
         contract,
         signed_paths,
-        load_patterns(DEFAULT_PATTERNS),
+        patterns,
         clean_signed_blank_pages=clean_blank,
+        ocr=False,
+    )
+    use_ocr = ask_use_ocr(
+        title, low_text_pages=int(probe.get("low_text_page_count") or 0)
+    )
+    result = (
+        locate(
+            contract,
+            signed_paths,
+            patterns,
+            clean_signed_blank_pages=clean_blank,
+            ocr=True,
+        )
+        if use_ocr
+        else probe
     )
     candidates = result["candidates"]
-    _log(f"步骤 3 完成：{len(candidates)} 个候选，已签实际 {signed_total} 页", "ok")
+    _log(
+        f"步骤 3 完成：{len(candidates)} 个候选，已签实际 {signed_total} 页"
+        f"{'（OCR）' if use_ocr else ''}",
+        "ok",
+    )
 
-    manual_label = "手动输入页码…"
-    range_text = ""
-    if candidates:
-        options = [
-            f"{chr(ord('A') + i)}. 第 {c['start']}–{c['end']} 页｜{c['page_count']} 页｜"
-            f"置信度 {c['confidence']}"
-            for i, c in enumerate(candidates)
-        ] + [manual_label]
-        picked = choose_from_list(
-            options,
-            f"步骤 3：选择要被替换的签字页（已签实际 {signed_total} 页）",
-            title,
-        )
-        if picked != manual_label:
-            c = candidates[options.index(picked)]
-            range_text = (
-                str(c["start"]) if c["start"] == c["end"] else f"{c['start']}-{c['end']}"
-            )
+    from ranges_util import format_ranges
 
-    # 4. Review, with the option to correct the range and look again
     while True:
-        if not range_text:
-            range_text = ask_text(
-                f"步骤 4：填写要被替换的合同页码（1–{contract_pages}）。\n"
-                "例如 12 或 12-13。",
-                range_text or "",
+        ranges = pick_candidate_ranges(
+            candidates,
+            contract_pages,
+            title,
+            prompt=(
+                f"步骤 3：选择要被替换的签字页（可多选；已签 {len(signed_paths)} 份 / "
+                f"{signed_total} 页）"
+            ),
+        )
+        if len(ranges) != len(signed_paths):
+            alert(
+                f"选中 {len(ranges)} 段，但已签文件有 {len(signed_paths)} 份。\n"
+                "请让段数与已签 PDF 份数一致（按页码升序一一对应）。",
                 title,
             )
-        try:
-            start, end = parse_range_text(range_text)
-        except ValueError as exc:
-            alert(f"页码无效：{exc}", title)
-            range_text = ""
             continue
-        if end > contract_pages:
-            alert(f"页码超出范围：合同只有 {contract_pages} 页。", title)
-            range_text = ""
-            continue
+        break
 
+    # Map ascending ranges ↔ signed files in user pick order
+    ranges_sorted = sorted(ranges)
+    replacements = [
+        (s, e, sp) for (s, e), sp in zip(ranges_sorted, signed_paths)
+    ]
+
+    # 4. Review (show first block thumbnails; list all in dialog)
+    start, end = ranges_sorted[0]
+    while True:
         review_html = build_review_page(
             review_dir=step4_dir,
             contract=contract,
@@ -855,16 +974,15 @@ def run_wizard(review_dir: Path) -> int:
             signed_blank_map=signed_blank_map,
             signed_total=signed_total,
             output=None,
-            locate_note=str(result.get("note") or ""),
+            locate_note=(
+                f"{result.get('note') or ''}｜全部区间：{format_ranges(ranges_sorted)}"
+            ),
         )
         subprocess.run(["open", str(review_html)], check=False)
-        _log(f"步骤 4：核对页已在浏览器打开（第 {start}–{end} 页）", "ok")
-
-        located = end - start + 1
         choice = ask_buttons(
-            f"步骤 4 核对：浏览器已打开核对页。\n\n"
-            f"将替换：第 {start}–{end} 页（{located} 页）\n"
-            f"将插入：{signed_total} 页\n\n"
+            "步骤 4 核对：浏览器已打开核对页（缩略图以第一段为例）。\n\n"
+            f"将替换：{format_ranges(ranges_sorted)}\n"
+            f"已签文件：{len(signed_paths)} 份，插入约 {signed_total} 页\n\n"
             "确认无误后继续生成。",
             ["改页码", "取消", "确认并生成"],
             "确认并生成",
@@ -873,39 +991,53 @@ def run_wizard(review_dir: Path) -> int:
         if choice == "确认并生成":
             break
         if choice == "取消":
-            _log("用户在步骤 4 取消", "info")
             return 1
-        range_text = ""
+        ranges = pick_candidate_ranges(
+            candidates,
+            contract_pages,
+            title,
+            prompt="重新选择区间（段数须等于已签 PDF 份数）",
+        )
+        if len(ranges) != len(signed_paths):
+            alert("段数与已签文件数不一致，请重选。", title)
+            continue
+        ranges_sorted = sorted(ranges)
+        replacements = [
+            (s, e, sp) for (s, e), sp in zip(ranges_sorted, signed_paths)
+        ]
+        start, end = ranges_sorted[0]
 
-    # 5. Output path, splice
+    # 5. Output path, splice (multi-range descending inside splice)
     default_out = default_output_path(contract)
     output = ask_save_path(default_out.name, contract.parent, "步骤 5：选择输出位置")
 
-    # The reviewed decision is authoritative: pages dropped here are never
-    # re-detected inside splice.
     removed_blank = sum(len(v) for v in signed_blank_map.values())
-    if len(signed_paths) > 1:
-        merged_tmp = review_dir / "signed_merged.pdf"
-        writer = PdfWriter()
-        for sp in signed_paths:
-            blanks = set(signed_blank_map.get(sp, []))
+    # Keep per-file blank maps; build replace list with cleaned signed files
+    replace_ops: list[tuple[int, int, Path]] = []
+    blank_pages_arg: dict[Path, list[int]] = {}
+    for (s, e), sp in zip(ranges_sorted, signed_paths):
+        blanks = signed_blank_map.get(sp, [])
+        if blanks:
+            cleaned = review_dir / f"signed_clean_{sp.stem}.pdf"
+            writer = PdfWriter()
+            blank_set = set(blanks)
             for page_no, page in enumerate(PdfReader(str(sp)).pages, start=1):
-                if page_no not in blanks:
+                if page_no not in blank_set:
                     writer.add_page(page)
-        with merged_tmp.open("wb") as f:
-            writer.write(f)
-        signed_for_splice = merged_tmp
-        blank_pages_arg = {merged_tmp: []}
-    else:
-        signed_for_splice = signed_paths[0]
-        blank_pages_arg = {signed_for_splice: signed_blank_map.get(signed_for_splice, [])}
+            with cleaned.open("wb") as f:
+                writer.write(f)
+            replace_ops.append((s, e, cleaned))
+            blank_pages_arg[cleaned] = []
+        else:
+            replace_ops.append((s, e, sp))
+            blank_pages_arg[sp] = []
 
     try:
         report = splice(
             contract,
-            [(start, end, signed_for_splice)],
+            replace_ops,
             output,
-            clean_signed_blank_pages=clean_blank,
+            clean_signed_blank_pages=False,
             signed_blank_pages=blank_pages_arg,
         )
     except SystemExit as exc:
@@ -921,6 +1053,7 @@ def run_wizard(review_dir: Path) -> int:
     summary = (
         f"已生成：{Path(report['output']).name}\n\n"
         f"页数：{report['old_page_count']} → {report['new_page_count']}\n"
+        f"替换区间：{format_ranges(ranges_sorted)}\n"
         f"跳过的空白已签页：{removed_blank} 页\n"
         f"提示：{('；'.join(warnings)) if warnings else '无'}"
     )
@@ -938,24 +1071,26 @@ def main() -> int:
 
     title = f"签字页作业台 · {UI_BUILD}"
     try:
-        mode = ask_buttons(
-            "请选择流程：\n\n"
-            "嵌回电子版：把已签签字页嵌回合同 PDF。\n"
-            "双面打印包：去掉签字页生成打印正文，并在双面碰撞处插入空白隔页。",
-            ["取消", "双面打印包", "嵌回电子版"],
-            "嵌回电子版",
+        # display dialog allows at most 3 buttons; use a list for 4 modes.
+        mode = choose_from_list(
+            [
+                "嵌回电子版（已签页嵌回，可多选候选）",
+                "双面打印包（去签字页 + 隔页，可多选候选）",
+                "批量打印包（多选多份合同，逐份确认）",
+            ],
+            "请选择流程：",
             title,
         )
     except UserCancelled:
         _log("已取消", "info")
         return 1
 
-    if mode == "取消":
-        return 1
-
     review_dir = Path(tempfile.mkdtemp(prefix="sigpage-review-"))
     try:
-        if mode == "双面打印包":
+        if mode.startswith("批量打印包"):
+            contracts = choose_pdfs("批量：选择多份合同 PDF")
+            return run_print_wizard(review_dir, contracts=contracts)
+        if mode.startswith("双面打印包"):
             return run_print_wizard(review_dir)
         return run_wizard(review_dir)
     except UserCancelled:

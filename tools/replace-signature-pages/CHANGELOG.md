@@ -13,9 +13,27 @@ Skill 说明：`.cursor/skills/replace-signature-pages/SKILL.md`
 
 ### Planned
 
-- 批量多合同处理
-- OCR 辅助定位（扫描件无文本层；可借用通用 PDF/OCR skill 作底层，决策仍归本工具）
-- 图形向导支持一次替换多个不连续区间（当前需用 CLI）
+- 非 macOS OCR 后端
+- 流程 A 多段各自缩略图核对页（当前以第一段为例 + 列表确认）
+
+---
+
+## [0.5.0] - 2026-08-03
+
+三项增强：GUI 多选候选、扫描件 OCR 定位、批量打印包。
+
+### Added
+
+- **GUI 多选候选**：`choose_from_list_multi`；流程 A/B 可一次勾选多段或手填 `8-9,20-21`
+- **流程 B 多段核对页**：各区间缩略图 + 隔页标注
+- **OCR 定位**：`page_ocr.py` + `macos_vision_ocr.swift`；`locate --ocr` 仅处理低文字页（本机 Vision）
+- **批量**：`batch_cli.py` / `cli.py --batch-dir`；GUI「批量打印包」多选合同；输出 `batch_report.json`
+- `--ranges-file` 非交互批量映射
+
+### Changed
+
+- CLI/GUI 定位可询问或传入 OCR 开关
+- Skill / README 同步多选、OCR、批量说明
 
 ---
 
@@ -164,4 +182,5 @@ Skill 说明：`.cursor/skills/replace-signature-pages/SKILL.md`
 | 0.3.0 | 2026-07-30 | 扫描件空白页按墨迹判定 + 原生向导 + 两处人工核对 |
 | 0.4.0 | 2026-08-03 | 流程 B 双面打印包（去签字页 + 隔页） |
 | 0.4.1 | 2026-08-03 | 流程 B GUI 缩略图核对页 |
-| Unreleased | — | OCR / 批量（规划中） |
+| 0.5.0 | 2026-08-03 | 多选候选 + OCR 定位 + 批量 |
+| Unreleased | — | 非 macOS OCR 等 |
