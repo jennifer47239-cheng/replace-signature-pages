@@ -29,11 +29,19 @@ Skill 说明：`.cursor/skills/replace-signature-pages/SKILL.md`
 - **OCR 定位**：`page_ocr.py` + `macos_vision_ocr.swift`；`locate --ocr` 仅处理低文字页（本机 Vision）
 - **批量**：`batch_cli.py` / `cli.py --batch-dir`；GUI「批量打印包」多选合同；输出 `batch_report.json`
 - `--ranges-file` 非交互批量映射
+- `ranges_util.py`：多段页码解析与格式化
 
 ### Changed
 
 - CLI/GUI 定位可询问或传入 OCR 开关
 - Skill / README 同步多选、OCR、批量说明
+- GUI 启动流程选择改为 **列表**（嵌回 / 双面打印包 / 批量），`UI_BUILD`：`ui-20260803-multi-ocr-batch`
+
+### Fixed
+
+- **macOS `display dialog` 最多 3 个按钮**：启动菜单原先 4 个按钮触发
+  `最多允许使用三个按钮 (-50)`；改为 `choose from list`
+- `ask_buttons` 超过 3 个按钮时提前报错，避免笼统的 osascript -50
 
 ---
 
@@ -182,5 +190,5 @@ Skill 说明：`.cursor/skills/replace-signature-pages/SKILL.md`
 | 0.3.0 | 2026-07-30 | 扫描件空白页按墨迹判定 + 原生向导 + 两处人工核对 |
 | 0.4.0 | 2026-08-03 | 流程 B 双面打印包（去签字页 + 隔页） |
 | 0.4.1 | 2026-08-03 | 流程 B GUI 缩略图核对页 |
-| 0.5.0 | 2026-08-03 | 多选候选 + OCR 定位 + 批量 |
+| 0.5.0 | 2026-08-03 | 多选/OCR/批量；修 macOS 启动菜单三按钮限制 |
 | Unreleased | — | 非 macOS OCR 等 |
