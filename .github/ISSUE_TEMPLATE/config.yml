@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 隐私提醒 / Privacy first
+    url: https://github.com/jennifer47239-cheng/replace-signature-pages/blob/main/PRIVACY.md
+    about: 提交任何 issue 前请先读隐私说明；切勿附带真实合同内容。
