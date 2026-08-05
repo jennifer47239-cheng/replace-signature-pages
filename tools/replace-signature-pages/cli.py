@@ -14,8 +14,14 @@ if str(TOOL_DIR) not in sys.path:
     sys.path.insert(0, str(TOOL_DIR))
 
 from extract_signature_pages import extract_signature_pages
+from export_grouped_packet import (
+    GROUP_BOTH,
+    GROUP_MODES,
+    export_grouped_packet,
+)
 from locate_signature_pages import DEFAULT_PATTERNS, load_patterns, locate
 from prepare_print_packet import prepare_print_packet
+from sig_unit import SigUnit, load_tags_file
 from splice_signature_pages import default_output_path, parse_range, splice
 
 CONFIRM_RE = re.compile(
@@ -26,6 +32,7 @@ CONFIRM_RE = re.compile(
 MODE_SPLICE = "splice"
 MODE_PRINT = "print-packet"
 MODE_EXTRACT = "extract"
+MODE_PACKET = "packet"
 
 
 def _banner(mode: str) -> None:
@@ -33,6 +40,8 @@ def _banner(mode: str) -> None:
         title = "双面打印包 · 去签字页 + 隔页（CLI）"
     elif mode == MODE_EXTRACT:
         title = "提取签字页 · 仅抽页（CLI · 流程 C）"
+    elif mode == MODE_PACKET:
+        title = "签字页分组包 · 按签署主体 / 签字人（CLI · 流程 C+）"
     else:
         title = "嵌回签字页 · 本机工具（CLI）"
     print(
@@ -475,33 +484,266 @@ def run_extract(
     return 0 if report.get("ok", True) else 2
 
 
+def _prompt_units_interactive(
+    ranges: list[tuple[int, int]],
+    *,
+    contract: Path,
+    ocr: bool = False,
+) -> list[SigUnit]:
+    from suggest_tags import suggest_tags_for_ranges
+
+    print("\n本机扫描签字页文字，生成签署主体 / 签字人候选（不上传、不调用 AI）…")
+    suggestions = suggest_tags_for_ranges(contract, ranges, ocr=ocr)
+    g = suggestions.get("global") or {}
+    print(
+        f"  候选签署主体 {len(g.get('investors') or [])} 个 · "
+        f"签字人 {len(g.get('signatories') or [])} 个"
+        "（签署主体可为投资方或融资方）"
+    )
+    for r in suggestions.get("ranges") or []:
+        print(
+            f"  · 第 {r['range']} 页：约 {r['block_estimate']} 块 · "
+            f"主体候选 {len(r.get('investors') or [])}"
+        )
+
+    use_wb = input(
+        "\n打开可视化标签工作台？（推荐 y；输入 n 则终端逐行填写）: "
+    ).strip().lower()
+    if use_wb in {"", "y", "yes", "是"}:
+        from tag_workbench import run_tag_workbench
+
+        thumb_paths: dict[int, Path] = {}
+        try:
+            import fitz
+
+            pages: set[int] = set()
+            for s, e in ranges:
+                pages.update(range(s, e + 1))
+            wb_dir = Path.cwd() / ".sigpage_tag_workbench" / "thumbs"
+            wb_dir.mkdir(parents=True, exist_ok=True)
+            doc = fitz.open(str(contract))
+            for page_no in sorted(pages):
+                page = doc.load_page(page_no - 1)
+                pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0), alpha=False)
+                out = wb_dir / f"p{page_no}.png"
+                pix.save(str(out))
+                thumb_paths[page_no] = out
+            doc.close()
+        except Exception:
+            thumb_paths = {}
+
+        units = run_tag_workbench(
+            work_dir=Path.cwd() / ".sigpage_tag_workbench",
+            contract_name=contract.name,
+            ranges=ranges,
+            suggestions=suggestions,
+            thumb_paths=thumb_paths,
+            open_browser=True,
+        )
+        for u in units:
+            u.document_name = contract.stem
+            u.source_contract = str(contract)
+        return units
+
+    print(
+        "\n终端填写：每一行 = 签署主体（投资方或融资方）+ 签字人；"
+        "同一页多方请对同一区间追加多行。\n"
+        "输入候选编号可快速填入，或直接输入文字。\n"
+    )
+    # Show numbered candidates
+    inv_pool = g.get("investors") or []
+    sig_pool = g.get("signatories") or []
+    if inv_pool:
+        print("签署主体候选：")
+        for i, v in enumerate(inv_pool[:20], 1):
+            print(f"  i{i}) {v}")
+    if sig_pool:
+        print("签字人候选：")
+        for i, v in enumerate(sig_pool[:20], 1):
+            print(f"  s{i}) {v}")
+
+    def _pick(prompt: str, pool: list[str], prefix: str) -> str:
+        raw = input(prompt).strip()
+        if raw.lower().startswith(prefix) and raw[1:].isdigit():
+            idx = int(raw[1:]) - 1
+            if 0 <= idx < len(pool):
+                return pool[idx]
+        return raw
+
+    filled: list[SigUnit] = []
+    for start, end in ranges:
+        label = f"{start}-{end}" if start != end else str(start)
+        print(f"\n── 区间第 {label} 页（可多行）──")
+        while True:
+            party = _pick(
+                "  签署主体（i编号 或 文字；投资方/融资方均可，回车结束本区间）: ",
+                inv_pool,
+                "i",
+            )
+            if party == "" and input("  结束本区间？(y/N): ").strip().lower() in {
+                "y",
+                "yes",
+                "是",
+            }:
+                break
+            if party == "" and not any(u.start == start for u in filled):
+                print("  至少填一个签署主体或签字人，或输入 y 跳过本区间")
+                if input("  跳过本区间？(y/N): ").strip().lower() in {"y", "yes", "是"}:
+                    break
+                continue
+            role = input("  角色（投资方/融资方/其他，可空）: ").strip()
+            signatory = _pick("  签字人（s编号 或 文字，可空）: ", sig_pool, "s")
+            capacity = input("  身份/职务（可空）: ").strip()
+            copies_raw = input("  份数（默认 1）: ").strip() or "1"
+            try:
+                copies = max(1, int(copies_raw))
+            except ValueError:
+                copies = 1
+            filled.append(
+                SigUnit(
+                    start=start,
+                    end=end,
+                    party=party,
+                    party_role=role,
+                    signatory=signatory,
+                    capacity=capacity,
+                    copies=copies,
+                    document_name=contract.stem,
+                    source_contract=str(contract),
+                )
+            )
+            more = input("  同一区间再加一方？(y/N): ").strip().lower()
+            if more not in {"y", "yes", "是"}:
+                break
+    return filled
+
+
+def run_packet(
+    contract: Path | None,
+    *,
+    output_dir: Path | None,
+    show_preview: bool,
+    patterns_path: Path,
+    ranges: list[tuple[int, int]] | None = None,
+    ocr: bool = False,
+    tags_path: Path | None = None,
+    group: str = GROUP_BOTH,
+) -> int:
+    _banner(MODE_PACKET)
+
+    if contract is None:
+        contract = _prompt_path("合同 PDF 路径")
+    elif not contract.is_file():
+        print(f"合同不存在: {contract}", file=sys.stderr)
+        return 1
+
+    if not patterns_path.is_file():
+        print(f"patterns.json 不存在: {patterns_path}", file=sys.stderr)
+        return 1
+
+    units: list[SigUnit]
+    if tags_path is not None:
+        if not tags_path.is_file():
+            print(f"tags 文件不存在: {tags_path}", file=sys.stderr)
+            return 1
+        try:
+            units = load_tags_file(
+                tags_path,
+                default_document=contract.stem,
+                default_contract=str(contract),
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"tags 无效: {exc}", file=sys.stderr)
+            return 1
+        print(f"已载入标签 {len(units)} 条：{tags_path}")
+    else:
+        if ranges is None:
+            if not ocr:
+                ocr_raw = input(
+                    "扫描件/低文字页是否启用本机 OCR？(默认 n，输入 y 开启): "
+                ).strip().lower()
+                ocr = ocr_raw in {"y", "yes", "是"}
+            _show_locate(
+                contract,
+                [],
+                show_preview=show_preview,
+                patterns_path=patterns_path,
+                clean_blank=False,
+                ocr=ocr,
+            )
+            ranges = _collect_ranges(purpose="抽取并分组")
+            if not ranges:
+                print("已取消。")
+                return 1
+        units = _prompt_units_interactive(ranges, contract=contract, ocr=ocr)
+
+    out_dir = output_dir or contract.parent
+    print(f"\n输出目录: {out_dir}")
+    print(f"分组模式: {group}")
+    final = input("最后确认，输入 y 生成分组包，其他键取消: ").strip().lower()
+    if final not in {"y", "yes", "是"}:
+        print("已取消。")
+        return 1
+
+    try:
+        report = export_grouped_packet(
+            contract,
+            units,
+            output_dir=out_dir,
+            group=group,
+        )
+    except SystemExit as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    print("\n完成。")
+    outs = report["outputs"]
+    print(f"  分组目录: {outs['packet_dir']}")
+    print(f"  标签备份: {outs['tags']}")
+    print(f"  说明: {outs['guide_md']}")
+    if outs.get("zip"):
+        print(f"  ZIP: {outs['zip']}")
+    if report.get("unlabeled_group_count"):
+        print(
+            f"  注意: 有 {report['unlabeled_group_count']} 个「未填」分组，"
+            "请补标签后重跑。"
+        )
+    for g in report.get("groups") or []:
+        mark = " [未填]" if g.get("unlabeled") else ""
+        print(f"  - {g['relative']}（{g['page_count']} 页）{mark}")
+    return 0 if report.get("ok", True) else 2
+
+
 def _choose_mode_interactive() -> str:
     print(
         "请选择模式：\n"
         "  1) 嵌回电子版（流程 A：已签页嵌回合同）\n"
         "  2) 双面打印包（流程 B：去签字页 + 隔页）\n"
         "  3) 提取签字页（流程 C：仅抽页，不改正文）\n"
+        "  4) 签字页分组包（流程 C+：按签署主体 / 签字人）\n"
     )
     while True:
-        raw = input("输入 1 / 2 / 3（默认 1）: ").strip() or "1"
+        raw = input("输入 1 / 2 / 3 / 4（默认 1）: ").strip() or "1"
         if raw in {"1", "a", "A", "splice"}:
             return MODE_SPLICE
         if raw in {"2", "b", "B", "print", "print-packet"}:
             return MODE_PRINT
         if raw in {"3", "c", "C", "extract"}:
             return MODE_EXTRACT
-        print("  请输入 1、2 或 3")
+        if raw in {"4", "d", "D", "packet", "group"}:
+            return MODE_PACKET
+        print("  请输入 1、2、3 或 4")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="本机签字页工具：嵌回 / 双面打印包 / 提取签字页（不经过 AI）",
+        description="本机签字页工具：嵌回 / 打印包 / 提取 / 分组（不经过 AI）",
     )
     parser.add_argument(
         "--mode",
-        choices=[MODE_SPLICE, MODE_PRINT, MODE_EXTRACT],
+        choices=[MODE_SPLICE, MODE_PRINT, MODE_EXTRACT, MODE_PACKET],
         default=None,
-        help="splice / print-packet / extract（省略则交互选择）",
+        help="splice / print-packet / extract / packet",
     )
     parser.add_argument("--contract", type=Path, help="合同 PDF（省略则交互输入）")
     parser.add_argument(
@@ -516,18 +758,29 @@ def main() -> int:
         action="append",
         default=[],
         dest="ranges",
-        help="确认的签字页范围（流程 B/C 非交互时可重复传入）",
+        help="确认的签字页范围（流程 B/C/C+ 非交互时可重复传入）",
     )
     parser.add_argument("--output", type=Path, help="流程 A 输出路径")
     parser.add_argument(
         "--output-dir",
         type=Path,
-        help="流程 B/C 输出目录（默认与合同同目录）",
+        help="流程 B/C/C+ 输出目录（默认与合同同目录）",
     )
     parser.add_argument(
         "--per-range",
         action="store_true",
         help="流程 C：按段各写一份签字页 PDF",
+    )
+    parser.add_argument(
+        "--tags",
+        type=Path,
+        help="流程 C+：标签 JSON/YAML（有则跳过交互填标签）",
+    )
+    parser.add_argument(
+        "--group",
+        choices=list(GROUP_MODES),
+        default=GROUP_BOTH,
+        help="流程 C+：signatory | party | investor(=party) | both（默认 both）",
     )
     parser.add_argument(
         "--show-preview",
@@ -613,6 +866,18 @@ def main() -> int:
             ranges=ranges,
             ocr=args.ocr,
             per_range=args.per_range,
+        )
+
+    if mode == MODE_PACKET:
+        return run_packet(
+            args.contract,
+            output_dir=args.output_dir,
+            show_preview=args.show_preview,
+            patterns_path=args.patterns,
+            ranges=ranges,
+            ocr=args.ocr,
+            tags_path=args.tags,
+            group=args.group,
         )
 
     return run_splice(

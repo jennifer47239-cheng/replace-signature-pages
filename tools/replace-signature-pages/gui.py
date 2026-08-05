@@ -21,7 +21,7 @@ if str(TOOL_DIR) not in sys.path:
     sys.path.insert(0, str(TOOL_DIR))
 
 # If dialogs lack this stamp in their title, you are not running this file.
-UI_BUILD = "ui-20260804-pick-mix"
+UI_BUILD = "ui-20260805-wb-drafts"
 
 
 class UserCancelled(Exception):
@@ -132,6 +132,21 @@ def choose_folder(prompt: str) -> Path:
     return Path(out)
 
 
+def choose_file(prompt: str, types: list[str] | None = None) -> Path:
+    """Pick any file; optional UTI / extension hints for macOS choose file."""
+    if types:
+        type_list = ", ".join(_as_literal(t) for t in types)
+        out = _osascript(
+            f"POSIX path of (choose file with prompt {_as_literal(prompt)} "
+            f"of type {{{type_list}}})",
+        )
+    else:
+        out = _osascript(
+            f"POSIX path of (choose file with prompt {_as_literal(prompt)})",
+        )
+    return Path(out)
+
+
 def ask_save_path(default_name: str, default_dir: Path, prompt: str) -> Path:
     out = _osascript(
         f"POSIX path of (choose file name with prompt {_as_literal(prompt)} "
@@ -211,7 +226,9 @@ def _html_document(title: str, verdict_class: str, verdict: str, body: str, foot
 """
 
 
-def _render_page_pngs(pdf: Path, pages: list[int], out_dir: Path, tag: str) -> dict[int, Path]:
+def _render_page_pngs(
+    pdf: Path, pages: list[int], out_dir: Path, tag: str, *, dpi: int = 72,
+) -> dict[int, Path]:
     """Rasterise 1-based `pages` of `pdf` into out_dir. Returns page → png path."""
     import fitz
 
@@ -221,7 +238,7 @@ def _render_page_pngs(pdf: Path, pages: list[int], out_dir: Path, tag: str) -> d
             if page_no < 1 or page_no > doc.page_count:
                 continue
             png = out_dir / f"{tag}_{page_no:04d}.png"
-            doc[page_no - 1].get_pixmap(dpi=72).save(str(png))
+            doc[page_no - 1].get_pixmap(dpi=dpi).save(str(png))
             rendered[page_no] = png
     return rendered
 
@@ -1382,6 +1399,175 @@ def run_wizard(review_dir: Path) -> int:
     return 0
 
 
+def run_packet_wizard(review_dir: Path) -> int:
+    """Flow C+: ranges → local suggest + visual multi-row tag workbench → export."""
+    from export_grouped_packet import GROUP_BOTH, export_grouped_packet
+    from locate_signature_pages import DEFAULT_PATTERNS, load_patterns, locate
+    from pypdf import PdfReader
+    from ranges_util import format_ranges
+    from sig_unit import SigUnit, load_tags_file
+    from suggest_tags import suggest_tags_for_ranges
+    from tag_workbench import run_tag_workbench
+
+    title = f"签字页分组包 · {UI_BUILD}"
+    extract_dir = review_dir / "packet"
+    extract_dir.mkdir(parents=True, exist_ok=True)
+
+    contract = choose_pdf("步骤 1：选择合同 PDF（将按标签分组签字页）")
+    contract_pages = len(PdfReader(str(contract)).pages)
+    _log(f"步骤 1：{contract.name}（{contract_pages} 页）", "ok")
+
+    source = choose_from_list(
+        [
+            "可视化标签工作台（推荐：先整理标签库，再按页分配）",
+            "选择已有标签 JSON 文件",
+        ],
+        "标签方式：",
+        title,
+    )
+
+    units: list[SigUnit]
+    ranges: list[tuple[int, int]]
+
+    if source.startswith("选择已有"):
+        tags_path = choose_file("选择标签 JSON 文件")
+        try:
+            units = load_tags_file(
+                tags_path,
+                default_document=contract.stem,
+                default_contract=str(contract),
+            )
+        except Exception as exc:  # noqa: BLE001
+            alert(f"标签文件无效：{exc}", title)
+            return 1
+        ranges = sorted({(u.start, u.end) for u in units})
+        _log(f"已载入标签 {len(units)} 条", "ok")
+    else:
+        patterns = load_patterns(DEFAULT_PATTERNS)
+        probe = locate(contract, [], patterns, ocr=False)
+        use_ocr = ask_use_ocr(
+            title, low_text_pages=int(probe.get("low_text_page_count") or 0)
+        )
+        result = locate(contract, [], patterns, ocr=True) if use_ocr else probe
+        candidates = result["candidates"]
+        ranges = pick_candidate_ranges(
+            candidates,
+            contract_pages,
+            title,
+            prompt="选择要分组的签字页（可多选；可同时手动补充）",
+        )
+        while True:
+            review_html = build_extract_review_page(
+                review_dir=extract_dir,
+                contract=contract,
+                contract_pages=contract_pages,
+                ranges=ranges,
+                locate_note="确认区间后将打开标签工作台（可一页多行）。",
+            )
+            subprocess.run(["open", str(review_html)], check=False)
+            choice = ask_buttons(
+                f"核对区间：{format_ranges(ranges)}\n\n浏览器已打开缩略图。",
+                ["改页码", "取消", "确认区间"],
+                "确认区间",
+                title,
+            )
+            if choice == "确认区间":
+                break
+            if choice == "取消":
+                raise UserCancelled()
+            ranges = pick_candidate_ranges(
+                candidates,
+                contract_pages,
+                title,
+                prompt="重新选择或手填多段页码",
+            )
+
+        _log("本机扫描签署主体 / 签字人候选…", "ok")
+        suggestions = suggest_tags_for_ranges(contract, ranges, ocr=use_ocr)
+        n_inv = len(suggestions.get("global", {}).get("investors") or [])
+        n_sig = len(suggestions.get("global", {}).get("signatories") or [])
+        _log(f"候选：签署主体 {n_inv} · 签字人 {n_sig}", "ok")
+
+        # Thumbnails for workbench
+        pages: set[int] = set()
+        for s, e in ranges:
+            pages.update(range(s, e + 1))
+        thumb_dir = extract_dir / "wb_thumbs"
+        thumb_dir.mkdir(exist_ok=True)
+        try:
+            thumb_paths = _render_page_pngs(
+                contract, sorted(pages), thumb_dir, "wb", dpi=144,
+            )
+        except Exception as exc:  # noqa: BLE001
+            _log(f"缩略图失败（可继续）：{exc}", "err")
+            thumb_paths = {}
+
+        ask_buttons(
+            "即将打开【标签工作台】浏览器页（两步）：\n\n"
+            "· 左侧：签字页缩略图（点击放大到整个左半屏），当前行对应页会高亮\n"
+            "· ① 标签库：核对/补齐签署主体（投资方或融资方）+ 签字人，点候选即可填入\n"
+            "· ② 分配页码：每行选一页 + 选一个标签；可「按页拆行」或「批量加行」\n"
+            "· 点「确认标签并继续」后回到本对话框\n\n"
+            "全程本机，不上传。",
+            ["打开工作台"],
+            "打开工作台",
+            title,
+        )
+        try:
+            units = run_tag_workbench(
+                work_dir=extract_dir / "workbench",
+                contract_name=contract.name,
+                ranges=ranges,
+                suggestions=suggestions,
+                thumb_paths=thumb_paths,
+                open_browser=True,
+            )
+        except TimeoutError as exc:
+            alert(str(exc), title)
+            return 1
+        except Exception as exc:
+            alert(f"工作台失败：{type(exc).__name__}: {exc}", title)
+            return 1
+
+        for u in units:
+            u.document_name = contract.stem
+            u.source_contract = str(contract)
+        _log(f"工作台确认 {len(units)} 条标签", "ok")
+
+    dest = choose_folder("选择分组包输出文件夹")
+    try:
+        report = export_grouped_packet(
+            contract,
+            units,
+            output_dir=dest,
+            group=GROUP_BOTH,
+        )
+    except SystemExit as exc:
+        alert(f"生成失败：{exc}", title)
+        return 1
+    except Exception as exc:
+        alert(f"生成失败：{type(exc).__name__}: {exc}", title)
+        return 1
+
+    outs = report["outputs"]
+    note = ""
+    if report.get("unlabeled_group_count"):
+        note = f"\n注意：有 {report['unlabeled_group_count']} 个未填标签分组。"
+    action = ask_buttons(
+        f"分组包已生成\n目录：{Path(outs['packet_dir']).name}\n"
+        f"标签行：{report['unit_count']}{note}",
+        ["在 Finder 中显示", "完成", "打开说明"],
+        "打开说明",
+        title,
+    )
+    if action == "打开说明" and outs.get("guide_md"):
+        subprocess.run(["open", str(outs["guide_md"])], check=False)
+    elif action == "在 Finder 中显示":
+        subprocess.run(["open", "-R", str(outs["packet_dir"])], check=False)
+    _log(f"分组包完成：{outs['packet_dir']}", "ok")
+    return 0
+
+
 def main() -> int:
     print(f"[replace-signature-pages] {UI_BUILD}", flush=True)
     print(f"[replace-signature-pages] loaded from: {Path(__file__).resolve()}", flush=True)
@@ -1394,6 +1580,7 @@ def main() -> int:
                 "嵌回电子版（已签页嵌回，可多选候选）",
                 "双面打印包（去签字页 + 隔页，可多选候选）",
                 "仅提取签字页（流程 C，可多选候选）",
+                "签字页分组包（按签署主体 / 签字人）",
                 "批量打印包（多选多份合同，逐份确认）",
             ],
             "请选择流程：",
@@ -1408,6 +1595,8 @@ def main() -> int:
         if mode.startswith("批量打印包"):
             contracts = choose_pdfs("批量：选择多份合同 PDF")
             return run_print_wizard(review_dir, contracts=contracts)
+        if mode.startswith("签字页分组包"):
+            return run_packet_wizard(review_dir)
         if mode.startswith("仅提取签字页"):
             return run_extract_wizard(review_dir)
         if mode.startswith("双面打印包"):

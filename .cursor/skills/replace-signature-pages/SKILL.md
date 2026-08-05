@@ -3,19 +3,20 @@ name: replace-signature-pages
 description: >-
   Local, privacy-first contract signature-page workbench for China legal wet-ink
   workflows: locate blank signature pages (optional on-device OCR for scans),
-  multi-select candidates, extract signature pages only (Flow C), splice signed
-  pages (Flow A), strip signature pages with duplex blank pads (Flow B), or
-  batch print packets. Use when the user mentions 签字页, 签署页, 提取签字页,
-  抽出签字页, 嵌回签字页, 空白签字页替换, 完整合同电子版, 双面打印,
+  multi-select candidates, extract signature pages (Flow C), group by investor
+  or signatory with local tags only (Flow C+), splice signed pages (Flow A),
+  strip signature pages with duplex blank pads (Flow B), or batch print packets.
+  Use when the user mentions 签字页, 签署页, 提取签字页, 抽出签字页, 分组,
+  投资方, 签字人, 嵌回签字页, 空白签字页替换, 完整合同电子版, 双面打印,
   去签字页打印, 隔页, 批量, OCR定位, 扫描件签字页, signature page replacement,
-  extract signature pages, duplex print packet, or inserting signed pages back
-  into a contract PDF. Prefer this skill over generic PDF merge skills for
-  signature-page tasks; do not invent one-off merge code.
+  extract signature pages, signature packet, duplex print packet, or inserting
+  signed pages back into a contract PDF. Prefer this skill over generic PDF
+  merge skills for signature-page tasks; do not invent one-off merge code.
 ---
 
 # Replace Signature Pages
 
-本地、隐私优先的**合同签字页作业台**：电子嵌回 + 纸质双面打印隔页 + **仅提取签字页**，专治法务湿签闭环。
+本地、隐私优先的**合同签字页作业台**：电子嵌回 + 纸质双面打印隔页 + **提取签字页** + **按投资方/签字人分组**，专治法务湿签闭环。
 
 不是 DocuSign（云端电子签），也不是通用 PDF merge skill。权威实现永远在本仓库
 `tools/replace-signature-pages/`。
@@ -43,13 +44,14 @@ Only use the Agent-assisted path below if the user explicitly confirms files are
 
 ---
 
-## Three flows
+## Flows
 
 | Flow | When | Output |
 |------|------|--------|
 | **A · 嵌回电子版** | 已有已签签字页 PDF，要嵌回合同 | `<stem>_已嵌签字页.pdf` |
 | **B · 双面打印包** | 纸质湿签：先打正文、单独签签字页 | 打印正文（去签字页+隔页）+ 待签署签字页 + 作业说明 |
 | **C · 提取签字页** | 只想从合同抽出签字页 PDF（不改正文） | `<stem>_签字页.pdf` + 提取说明 |
+| **C+ · 分组包** | 按投资方 / 签字人分包（本机标签） | `*_签字页分组包/` + ZIP |
 
 Never overwrite the source contract.
 
@@ -58,15 +60,16 @@ Never overwrite the source contract.
 - Nest signed signature-page PDFs into blank signature slots (Flow A)
 - Generate a print packet without signature pages, with duplex collision pads (Flow B)
 - Extract signature pages only for signing packets / archive (Flow C)
+- Group extracted pages by **investor** or **signatory** using local tags (Flow C+)
 - Auto-suggest where signature pages are (Chinese/English cues)
 - Compare located page count `L` vs signed page count `S` before splicing (Flow A)
 
-Out of scope: batch *creating* signature pages; pasting signature images onto blanks; cloud e-sign APIs; LLM tagging / Party-Signatory grouping ZIP (planned later, local rules only).
+Out of scope: batch *creating* signature pages; pasting signature images onto blanks; cloud e-sign APIs; LLM auto-tagging of parties.
 
 ## Hard rules
 
 1. **Prefer local CLI/GUI** for real contracts. Agent orchestration is opt-in for sanitized files only.
-2. **No splice / print-packet / extract without confirmed page ranges.** If the user has not confirmed pages, only run locate.
+2. **No splice / print-packet / extract / packet without confirmed page ranges** (packet may load ranges from tags file). If the user has not confirmed pages, only run locate.
 3. **Never overwrite** the contract PDF.
 4. If `L != S` (Flow A), explain equal-page vs expand-page options; wait for user choice.
 5. Multiple signature blocks → map each signed file to a range, then splice in **descending page order**.
@@ -74,7 +77,7 @@ Out of scope: batch *creating* signature pages; pasting signature images onto bl
 7. Do **not** invent one-off merge code. Always call scripts under `tools/replace-signature-pages/`.
 8. Pass `--redact-preview` on locate when printing JSON into the chat.
 9. Generic PDF/OCR skills may help with non-signature PDF ops — **signature-page decisions and privacy rules stay in this skill.**
-10. **No LLM** for this skill path. Extraction is pure `pypdf` page copy after human-confirmed ranges.
+10. **No LLM** for this skill path. Grouping uses **layer A tags only** (JSON/hand entry). Do not upload pages for identity extraction.
 
 ---
 
@@ -226,16 +229,66 @@ Outputs:
 
 ---
 
+## Workflow C+ — Group by investor / signatory (sanitized files only)
+
+**Layer A tags only** (JSON hand-authored or interactive). No LLM. Unredacted → local CLI/GUI only.
+
+```
+Task Progress:
+- [ ] 1. Collect contract PDF
+- [ ] 2. Confirm ranges (or load from tags file)
+- [ ] 3. Fill / load investor + signatory tags
+- [ ] 4. Run export_grouped_packet (--group both)
+- [ ] 5. Report packet dir + unlabeled buckets
+```
+
+### Command
+
+```bash
+.venv/bin/python tools/replace-signature-pages/cli.py --mode packet \
+  --contract "/path/to/contract.pdf" \
+  --tags "/path/to/tags.json" \
+  --group both \
+  --output-dir "/path/to/out"
+```
+
+Tag schema: see `tools/replace-signature-pages/examples/tags.example.json`.
+
+Same page, multiple parties → multiple units with the **same** `range`.
+
+Each unit's `range` decides which pages that label gets. Different parties must
+carry **their own** page(s); if every unit keeps the same multi-page block, each
+grouped PDF contains that whole block and looks ungrouped.
+
+GUI/CLI workbench is two-step: **① 标签库** (review/edit the parties first) →
+**② 分配页码** (pick a page per row, then pick a label; ◀ ▶ walks pages and the
+left preview follows; 「批量加行」= one label × many pages). Candidate chips use
+a fixed-height scroll area. 「保存标签草稿」writes only to the local work directory
+and restores the library / rows / current step after a page refresh.
+
+Outputs under `<stem>_签字页分组包/`:
+
+- `按签字人/*.pdf`
+- `按投资方/*.pdf`
+- `tags.json` / `manifest.json` / `分组说明.md`
+- sibling ZIP: `<stem>_签字页分组包.zip`
+
+---
+
 ## Scripts (canonical)
 
 | Path | Role |
 |------|------|
-| `tools/replace-signature-pages/cli.py` | Interactive CLI（`--mode splice` / `print-packet` / `extract`） |
-| `tools/replace-signature-pages/gui.py` | 本地图形向导（嵌回 / 打印包 / 提取 / 批量打印包） |
+| `tools/replace-signature-pages/cli.py` | Interactive CLI（`splice` / `print-packet` / `extract` / `packet`） |
+| `tools/replace-signature-pages/gui.py` | 本地图形向导（嵌回 / 打印包 / 提取 / 分组 / 批量） |
 | `tools/replace-signature-pages/locate_signature_pages.py` | Read-only locate + L/S JSON |
 | `tools/replace-signature-pages/splice_signature_pages.py` | Confirmed page splice（流程 A） |
 | `tools/replace-signature-pages/prepare_print_packet.py` | 去签字页 + 双面隔页 + 抽出签字页（流程 B） |
 | `tools/replace-signature-pages/extract_signature_pages.py` | 仅提取签字页（流程 C） |
+| `tools/replace-signature-pages/sig_unit.py` | 标签单元 + tags JSON |
+| `tools/replace-signature-pages/suggest_tags.py` | 本机扫描投资方/签字人候选（层 B） |
+| `tools/replace-signature-pages/tag_workbench.py` | 可视化标签工作台（标签库 → 按页分配） |
+| `tools/replace-signature-pages/export_grouped_packet.py` | 按投资方/签字人分组（流程 C+） |
 | `tools/replace-signature-pages/batch_cli.py` | 批量流程 B（交互确认或 ranges-file） |
 | `tools/replace-signature-pages/page_ocr.py` | 本机 macOS Vision OCR（低文字页） |
 | `tools/replace-signature-pages/patterns.json` | CN/EN keyword weights |

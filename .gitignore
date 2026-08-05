@@ -6,3 +6,5 @@ __pycache__/
 *.tmp
 ._*
 tools/replace-signature-pages/.macos_vision_ocr
+# Local tag workbench scratch (page thumbnails + draft tags with real names)
+.sigpage_tag_workbench/

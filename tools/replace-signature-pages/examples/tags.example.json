@@ -1,0 +1,32 @@
+{
+  "contract": "示例合同.pdf",
+  "document_name": "示例合同",
+  "units": [
+    {
+      "range": "8-9",
+      "party": "某某创业投资合伙企业（有限合伙）",
+      "party_role": "投资方",
+      "signatory": "张三",
+      "capacity": "委派代表",
+      "copies": 1
+    },
+    {
+      "range": "20-21",
+      "party": "某某科技股份有限公司",
+      "party_role": "融资方",
+      "signatory": "李四",
+      "capacity": "法定代表人",
+      "copies": 1,
+      "notes": "融资方/公司签字块，不是投资方"
+    },
+    {
+      "range": "20-21",
+      "party": "某某管理有限公司",
+      "party_role": "投资方",
+      "signatory": "王五",
+      "capacity": "授权代表",
+      "copies": 1,
+      "notes": "同一页多方：融资方与投资方可各占一行"
+    }
+  ]
+}
